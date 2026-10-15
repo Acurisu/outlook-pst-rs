@@ -551,7 +551,7 @@ where
     ) -> io::Result<Self> {
         let block = block_btree.find_entry(f, key, page_cache, control)?;
         let data = DataTree::<Pst>::read(f, encoding, &block, control)?
-            .block_cursor(control)?
+            .structure_cursor(control)?
             .read_all(f, encoding, block_btree, page_cache)?;
 
         Ok(Self {

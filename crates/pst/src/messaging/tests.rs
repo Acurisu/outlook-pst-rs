@@ -1,6 +1,7 @@
 use super::{
     attachment::{Attachment, AttachmentMethod},
     store::{Store, UnicodeStore},
+    MessagingError,
 };
 use crate::{
     ltp::{
@@ -8,6 +9,7 @@ use crate::{
         prop_context::{PropertyTreeRecordValue, PropertyValue, PropertyValueRecord},
         prop_type::PropertyType,
         read_write::*,
+        table_context::TableContextInfo,
         tree::HeapTreeHeader,
     },
     ndb::{
@@ -64,9 +66,14 @@ fn heap(mut properties: Vec<(u16, PropertyType, Value)>) -> Vec<u8> {
         .unwrap()
         .write(&mut tree)
         .unwrap();
-    let allocations = std::iter::once(tree)
-        .chain(std::iter::once(records))
-        .chain(values);
+    heap_node(
+        HeapNodeType::Properties,
+        [tree, records].into_iter().chain(values),
+    )
+}
+
+/// A single-block heap whose user root is its first allocation.
+fn heap_node(node_type: HeapNodeType, allocations: impl IntoIterator<Item = Vec<u8>>) -> Vec<u8> {
     let mut data = vec![0; 12];
     let mut offsets = vec![12u16];
     for allocation in allocations {
@@ -82,7 +89,7 @@ fn heap(mut properties: Vec<(u16, PropertyType, Value)>) -> Vec<u8> {
     }
     HeapNodeHeader::new(
         map_offset,
-        HeapNodeType::Properties,
+        node_type,
         HeapId::new(1, 0).unwrap(),
         [HeapFillLevel::Empty; 8],
     )
@@ -186,14 +193,27 @@ fn folder_id() -> NodeId {
     NodeId::new(NodeIdType::NormalFolder, 0x200).unwrap()
 }
 
-fn object_heap(method: AttachmentMethod) -> Vec<u8> {
+/// Attachment methods whose 0x3701 payload is optional.
+const OPTIONAL_DATA_METHODS: [AttachmentMethod; 4] = [
+    AttachmentMethod::None,
+    AttachmentMethod::ByReference,
+    AttachmentMethod::ByReferenceOnly,
+    AttachmentMethod::ByWebReference,
+];
+
+/// A `PtypObject` 0x3701 value referring to the message subnode.
+fn object_data() -> (u16, PropertyType, Value) {
     let mut object = Vec::new();
     object
         .write_u32::<LittleEndian>(u32::from(message_id()))
         .unwrap();
     object.write_u32::<LittleEndian>(0).unwrap();
+    (0x3701, PropertyType::Object, Value::Bytes(object))
+}
+
+fn object_heap(method: AttachmentMethod) -> Vec<u8> {
     heap(vec![
-        (0x3701, PropertyType::Object, Value::Bytes(object)),
+        object_data(),
         (0x3705, PropertyType::Integer32, Value::Small(method as u32)),
     ])
 }
@@ -208,7 +228,9 @@ fn store_heap() -> Vec<u8> {
 }
 
 /// Opens the only attachment of a message, with the given attachment properties.
-fn single_attachment(properties: Vec<(u16, PropertyType, Value)>) -> Rc<dyn Attachment> {
+fn single_attachment(
+    properties: Vec<(u16, PropertyType, Value)>,
+) -> io::Result<Rc<dyn Attachment>> {
     let mut f = Fixture::new();
     let store = f.block(store_heap(), false);
     let attachment = f.block(heap(properties), false);
@@ -235,7 +257,6 @@ fn single_attachment(properties: Vec<(u16, PropertyType, Value)>) -> Rc<dyn Atta
         )
         .unwrap()
         .open_attachment(attachment_id(), None)
-        .unwrap()
 }
 
 fn fixture(control: ReadControl) -> Rc<dyn Store> {
@@ -381,12 +402,7 @@ fn object_safe_nested_attachments_preserve_payload_and_metadata() {
 
 #[test]
 fn optional_binary_data_is_preserved_for_reference_methods() {
-    for method in [
-        AttachmentMethod::None,
-        AttachmentMethod::ByReference,
-        AttachmentMethod::ByReferenceOnly,
-        AttachmentMethod::ByWebReference,
-    ] {
+    for method in OPTIONAL_DATA_METHODS {
         for payload in [None, Some(&b""[..]), Some(&b"reference payload"[..])] {
             let mut properties =
                 vec![(0x3705, PropertyType::Integer32, Value::Small(method as u32))];
@@ -399,7 +415,7 @@ fn optional_binary_data_is_preserved_for_reference_methods() {
                 };
                 properties.push((0x3701, PropertyType::Binary, value));
             }
-            let attachment = single_attachment(properties);
+            let attachment = single_attachment(properties).unwrap();
             assert!(attachment.embedded_message().is_none());
             let mut output = Vec::new();
             let copied = attachment.copy_data(&mut output).unwrap();
@@ -414,6 +430,28 @@ fn optional_binary_data_is_preserved_for_reference_methods() {
                 "{method:?} {payload:?}"
             );
         }
+    }
+}
+
+#[test]
+fn unsupported_reference_attachment_data_is_an_error() {
+    for method in OPTIONAL_DATA_METHODS {
+        let Err(error) = single_attachment(vec![
+            object_data(),
+            (0x3705, PropertyType::Integer32, Value::Small(method as u32)),
+        ]) else {
+            panic!("{method:?} attachment with object data opened");
+        };
+        assert!(
+            matches!(
+                error.get_ref().and_then(|error| error.downcast_ref()),
+                Some(MessagingError::UnsupportedAttachmentData(
+                    unsupported,
+                    PropertyType::Object,
+                )) if *unsupported == method
+            ),
+            "{method:?}: {error}"
+        );
     }
 }
 
@@ -448,6 +486,76 @@ fn folder_tables_distinguish_absence_from_corruption_and_do_not_cache_errors() {
     assert_eq!(
         folder.hierarchy_table().err().unwrap().kind(),
         io::ErrorKind::Other
+    );
+}
+
+#[test]
+fn folder_rows_are_bounded_by_the_structure_limit_not_the_payload_limit() {
+    // 64 rows of 8 bytes, stored in the contents table's own subnode.
+    let count_rows = |max_payload, max_structure| {
+        let mut f = Fixture::new();
+        let store = f.block(store_heap(), false);
+        let folder = f.block(
+            heap(vec![(0x3602, PropertyType::Integer32, Value::Small(64))]),
+            false,
+        );
+        let row_matrix_id = NodeId::new(NodeIdType::ListsTablesProperties, 0x300).unwrap();
+        let row_matrix = (1..=64u32)
+            .flat_map(|id| [id, 0])
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        let row_matrix = f.block(row_matrix, false);
+        let subnodes = f.subnodes(vec![UnicodeLeafSubNodeTreeEntry::new(
+            row_matrix_id,
+            row_matrix,
+            None,
+        )]);
+        let mut info = Vec::new();
+        TableContextInfo::new(
+            8,
+            8,
+            8,
+            8,
+            HeapId::default(),
+            Some(row_matrix_id),
+            Vec::new(),
+        )
+        .unwrap()
+        .write(&mut info)
+        .unwrap();
+        let contents = f.block(heap_node(HeapNodeType::Table, [info]), false);
+        let mut nodes = vec![
+            UnicodeNodeBTreeEntry::new(NID_MESSAGE_STORE, store, None, None),
+            UnicodeNodeBTreeEntry::new(folder_id(), folder, None, None),
+            UnicodeNodeBTreeEntry::new(
+                NodeId::new(NodeIdType::ContentsTable, folder_id().index()).unwrap(),
+                contents,
+                Some(subnodes),
+                None,
+            ),
+        ];
+        nodes.sort_by_key(|node| u32::from(node.node()));
+        let store = f.finish(
+            nodes,
+            ReadControl::new(ReadLimits {
+                max_payload,
+                max_structure,
+                ..ReadLimits::default()
+            }),
+        );
+        let folder = store
+            .open_folder(&store.properties().make_entry_id(folder_id()).unwrap())
+            .unwrap();
+        let table = folder.contents_table().unwrap().unwrap();
+        let count = table
+            .rows_matrix()
+            .try_fold(0, |count, row| row.map(|_| count + 1));
+        count
+    };
+    assert_eq!(count_rows(256, 1024).unwrap(), 64);
+    assert_eq!(
+        count_rows(1024, 256).unwrap_err().to_string(),
+        "PST read structure limit exceeded"
     );
 }
 

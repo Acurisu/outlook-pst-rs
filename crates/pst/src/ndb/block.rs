@@ -784,15 +784,39 @@ where
         Ok(reader)
     }
 
-    /// Start an owned forward traversal without retaining a file lock.
+    /// Start an owned forward traversal without retaining a file lock, bounded by
+    /// `max_payload`.
     pub fn block_cursor(&self, control: &ReadControl) -> io::Result<DataTreeBlockCursor<Pst>>
+    where
+        Pst::DataBlock: Clone,
+    {
+        self.cursor(control, ReadControl::check_payload)
+    }
+
+    /// Like `block_cursor`, but for a structure such as a table's row matrix or a heap,
+    /// bounded by `max_structure` instead.
+    pub(crate) fn structure_cursor(
+        &self,
+        control: &ReadControl,
+    ) -> io::Result<DataTreeBlockCursor<Pst>>
+    where
+        Pst::DataBlock: Clone,
+    {
+        self.cursor(control, ReadControl::check_structure)
+    }
+
+    fn cursor(
+        &self,
+        control: &ReadControl,
+        check_size: SizeCheck,
+    ) -> io::Result<DataTreeBlockCursor<Pst>>
     where
         Pst::DataBlock: Clone,
     {
         control.check()?;
         let (stack, first) = match self {
             DataTree::Intermediate(block) => {
-                control.check_payload(block.header().total_size() as usize)?;
+                check_size(control, block.header().total_size() as usize)?;
                 let frame = TreeFrame::new(
                     block.header().level(),
                     block.entries().iter().map(|entry| entry.block()),
@@ -801,7 +825,7 @@ where
                 (vec![frame], None)
             }
             DataTree::Leaf(block) => {
-                control.check_payload(block.data().len())?;
+                check_size(control, block.data().len())?;
                 (Vec::new(), Some(block.as_ref().clone()))
             }
         };
@@ -809,6 +833,7 @@ where
             stack,
             first,
             bytes: 0,
+            check_size,
             control: control.clone(),
         })
     }
@@ -879,11 +904,15 @@ struct DataTreeReader<'a, Pst: PstFile, R: PstReader> {
     offset: usize,
 }
 
+/// The read limit a data tree's total size is checked against.
+type SizeCheck = fn(&ReadControl, usize) -> io::Result<()>;
+
 /// Incremental data-tree traversal retaining only the active path and one initial leaf.
 pub struct DataTreeBlockCursor<Pst: PstFile> {
     stack: Vec<TreeFrame<Pst::BlockId>>,
     first: Option<Pst::DataBlock>,
     bytes: usize,
+    check_size: SizeCheck,
     control: ReadControl,
 }
 
@@ -949,7 +978,7 @@ where
             .bytes
             .checked_add(block.data().len())
             .ok_or_else(|| limit_error("PST payload size overflow"))?;
-        self.control.check_payload(self.bytes)?;
+        (self.check_size)(&self.control, self.bytes)?;
         Ok(Some(block))
     }
 
@@ -1698,8 +1727,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn forward_cursor_counts_actual_payload_and_does_not_revisit_prior_leaves() {
+    /// A data tree of two 3-byte leaves, "abc" at offset 0 and "def" at offset 64. Its
+    /// advertised total size is 0, which must not bypass the actual byte limits.
+    fn two_leaf_tree() -> (UnicodeBlockBTree, UnicodeDataTree, Cursor<Vec<u8>>) {
         let ids = [
             UnicodeBlockId::new(false, 2).unwrap(),
             UnicodeBlockId::new(false, 3).unwrap(),
@@ -1708,11 +1738,15 @@ mod tests {
             UnicodeBlockBTreeEntry::new(UnicodeBlockRef::new(ids[0], UnicodeByteIndex::new(0)), 3),
             UnicodeBlockBTreeEntry::new(UnicodeBlockRef::new(ids[1], UnicodeByteIndex::new(64)), 3),
         ];
-        let btree = block_btree(&entries);
-        let tree = data_tree(&ids, 0); // An untrusted size must not bypass the actual byte limit.
         let mut input = Cursor::new(Vec::new());
         leaf(b"abc", ids[0]).write(&mut input).unwrap();
         leaf(b"def", ids[1]).write(&mut input).unwrap();
+        (block_btree(&entries), data_tree(&ids, 0), input)
+    }
+
+    #[test]
+    fn forward_cursor_counts_actual_payload_and_does_not_revisit_prior_leaves() {
+        let (btree, tree, mut input) = two_leaf_tree();
         let control = ReadControl::new(ReadLimits {
             max_payload: 5,
             ..ReadLimits::default()
@@ -1733,13 +1767,48 @@ mod tests {
     }
 
     #[test]
-    fn advertised_payload_and_raw_block_allocation_are_bounded() {
+    fn structure_and_payload_limits_are_independent() {
+        let (btree, tree, input) = two_leaf_tree();
+        let read = |structure: bool, max_payload, max_structure| {
+            let control = ReadControl::new(ReadLimits {
+                max_payload,
+                max_structure,
+                ..ReadLimits::default()
+            });
+            let mut cursor = if structure {
+                tree.structure_cursor(&control)?
+            } else {
+                tree.block_cursor(&control)?
+            };
+            let (mut input, mut cache) = (input.clone(), Default::default());
+            let mut bytes = 0;
+            while let Some(block) =
+                cursor.next_block(&mut input, NdbCryptMethod::None, &btree, &mut cache)?
+            {
+                bytes += block.data().len();
+            }
+            io::Result::Ok(bytes)
+        };
+        assert_eq!(read(true, 5, 6).unwrap(), 6);
+        assert!(read(true, 6, 5).is_err());
+        assert_eq!(read(false, 6, 5).unwrap(), 6);
+        assert!(read(false, 5, 6).is_err());
+    }
+
+    #[test]
+    fn advertised_size_and_raw_block_allocation_are_bounded() {
         let tree = data_tree(&[], 100);
-        let control = ReadControl::new(ReadLimits {
-            max_payload: 10,
-            ..ReadLimits::default()
-        });
-        assert!(tree.block_cursor(&control).is_err());
+        let limits = |max_payload, max_structure| {
+            ReadControl::new(ReadLimits {
+                max_payload,
+                max_structure,
+                ..ReadLimits::default()
+            })
+        };
+        assert!(tree.block_cursor(&limits(10, 100)).is_err());
+        assert!(tree.block_cursor(&limits(100, 10)).is_ok());
+        assert!(tree.structure_cursor(&limits(100, 10)).is_err());
+        assert!(tree.structure_cursor(&limits(10, 100)).is_ok());
         let id = UnicodeBlockId::new(false, 2).unwrap();
         let entry =
             UnicodeBlockBTreeEntry::new(UnicodeBlockRef::new(id, UnicodeByteIndex::new(0)), 100);

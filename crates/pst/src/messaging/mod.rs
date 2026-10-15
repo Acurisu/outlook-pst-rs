@@ -174,6 +174,11 @@ pub enum MessagingError {
     AttachmentFileBinaryDataNotFound,
     #[error("Invalid PidTagAttachDataBinary on afByValue attachment: {0:?}")]
     InvalidAttachmentFileBinaryData(crate::ltp::prop_type::PropertyType),
+    #[error("Unsupported attachment data on {0:?} attachment: {1:?}")]
+    UnsupportedAttachmentData(
+        attachment::AttachmentMethod,
+        crate::ltp::prop_type::PropertyType,
+    ),
     #[error("Missing PidTagAttachDataObject on afStorage attachment")]
     AttachmentStorageObjectDataNotFound,
     #[error("Reading afStorage attachment failed: {0}")]

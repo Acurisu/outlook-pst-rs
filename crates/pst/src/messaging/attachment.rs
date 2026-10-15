@@ -284,12 +284,22 @@ where
                 }
             }
             // Payloads are optional for these methods, but keep one if the item has it.
+            // Only binary data can be streamed, so any other representation is an error
+            // rather than being reported as absent.
             AttachmentMethod::None
             | AttachmentMethod::ByReference
             | AttachmentMethod::ByReferenceOnly
-            | AttachmentMethod::ByWebReference => {
-                binary.map_or(AttachmentContent::None, AttachmentContent::Binary)
-            }
+            | AttachmentMethod::ByWebReference => match (binary, properties.get(ATTACH_DATA)) {
+                (Some(record), _) => AttachmentContent::Binary(record),
+                (None, None) => AttachmentContent::None,
+                (None, Some(value)) => {
+                    return Err(MessagingError::UnsupportedAttachmentData(
+                        method,
+                        PropertyType::from(value),
+                    )
+                    .into())
+                }
+            },
         };
 
         Ok(Self {

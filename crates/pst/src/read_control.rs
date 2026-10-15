@@ -17,8 +17,12 @@ pub struct ReadLimits {
     /// Maximum bytes in an individual decoded buffer or retained collection.
     /// This is not a bound on total process memory or allocator overhead.
     pub max_allocation: usize,
-    /// Maximum bytes in one logical property, attachment, or data-tree payload.
+    /// Maximum bytes in one property value or attachment payload.
     pub max_payload: usize,
+    /// Maximum bytes in one structural data tree, such as a table's row matrix or a heap.
+    /// Row matrices are traversed lazily, and retained heaps are also bounded by
+    /// `max_allocation`, so this can exceed `max_payload` without retaining more memory.
+    pub max_structure: usize,
 }
 
 impl Default for ReadLimits {
@@ -28,6 +32,7 @@ impl Default for ReadLimits {
             max_work: 10_000_000,
             max_allocation: 64 * 1024 * 1024,
             max_payload: 256 * 1024 * 1024,
+            max_structure: 1024 * 1024 * 1024,
         }
     }
 }
@@ -117,6 +122,14 @@ impl ReadControl {
         self.check()?;
         if bytes > self.limits().max_payload {
             return Err(limit_error("PST read payload limit exceeded"));
+        }
+        Ok(())
+    }
+
+    pub fn check_structure(&self, bytes: usize) -> io::Result<()> {
+        self.check()?;
+        if bytes > self.limits().max_structure {
+            return Err(limit_error("PST read structure limit exceeded"));
         }
         Ok(())
     }
@@ -240,6 +253,7 @@ mod tests {
             max_depth: 2,
             max_allocation: 4,
             max_payload: 8,
+            max_structure: 16,
         });
         control.charge(usize::MAX).unwrap();
         assert!(control.charge(1).is_err());
@@ -249,6 +263,8 @@ mod tests {
         assert!(control.check_allocation(5).is_err());
         control.check_payload(8).unwrap();
         assert!(control.check_payload(9).is_err());
+        control.check_structure(16).unwrap();
+        assert!(control.check_structure(17).is_err());
     }
 
     #[test]

@@ -1034,7 +1034,7 @@ where
             Some(tree) => {
                 let cursor = match &mut cursor {
                     Some(cursor) => cursor,
-                    None => cursor.insert(tree.block_cursor(pst.read_control())?),
+                    None => cursor.insert(tree.structure_cursor(pst.read_control())?),
                 };
                 let mut file = pst
                     .reader()

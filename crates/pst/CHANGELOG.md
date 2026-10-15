@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Shared configurable read limits and cooperative cancellation.
+- `ReadLimits::max_structure`, which bounds table row matrices and heaps separately from
+  `max_payload`.
 - Incremental table rows and data-tree cursors, and streamed attachment payload copying.
 - Object-safe attachment opening for messages and recursively embedded messages.
 
@@ -33,6 +35,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Empty variable-size table columns (heap ID 0) failing to decode instead of reading as null.
 - `Attachment::copy_data` returning `None` for reference and `afNone` attachments that have a
   `PidTagAttachDataBinary` (0x3701) value.
+- Reference and `afNone` attachments with a non-binary 0x3701 value reporting no data instead of
+  failing with `UnsupportedAttachmentData`.
 
 ## [1.2.0](https://github.com/microsoft/outlook-pst-rs/compare/outlook-pst-v1.1.0...outlook-pst-v1.2.0) - 2026-03-17
 
