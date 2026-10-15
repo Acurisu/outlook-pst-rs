@@ -31,6 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Unbounded decoded row retention, traversal, and page-cache growth.
 - Cyclic or mis-leveled B-tree, data-tree, and subnode-tree pages accepted during traversal.
 - Empty variable-size table columns (heap ID 0) failing to decode instead of reading as null.
+- `Attachment::copy_data` returning `None` for reference and `afNone` attachments that have a
+  `PidTagAttachDataBinary` (0x3701) value.
 
 ## [1.2.0](https://github.com/microsoft/outlook-pst-rs/compare/outlook-pst-v1.1.0...outlook-pst-v1.2.0) - 2026-03-17
 

@@ -132,7 +132,9 @@ pub trait Attachment {
     fn message(&self) -> Rc<dyn Message>;
     fn properties(&self) -> &AttachmentProperties;
     fn embedded_message(&self) -> Option<&Rc<dyn Message>>;
-    /// Copies a by-value or storage payload. Other attachment methods return `None`.
+    /// Copies the binary property 0x3701, no matter the attachment method, or the storage
+    /// object and returns its length. Returns `None` when neither is present, including
+    /// for embedded messages; a present, empty binary property returns `Some(0)`.
     /// A failed copy may have written a prefix. Payload/work limits and cancellation
     /// are enforced through the store's read control. No complete payload is cached.
     fn copy_data(&self, writer: &mut dyn io::Write) -> io::Result<Option<u64>>;
@@ -153,7 +155,7 @@ const ATTACH_DATA: u16 = 0x3701;
 
 /// Where an attachment's payload lives, resolved when the attachment is opened.
 enum AttachmentContent<Pst: PstFile> {
-    /// The attachment method has no payload, e.g. a reference.
+    /// Neither a binary nor an object payload.
     None,
     /// Binary property 0x3701, streamed by `copy_data`.
     Binary(PropertyTreeRecordValue),
@@ -281,7 +283,13 @@ where
                     AttachmentContent::Embedded(embedded)
                 }
             }
-            _ => AttachmentContent::None,
+            // Payloads are optional for these methods, but keep one if the item has it.
+            AttachmentMethod::None
+            | AttachmentMethod::ByReference
+            | AttachmentMethod::ByReferenceOnly
+            | AttachmentMethod::ByWebReference => {
+                binary.map_or(AttachmentContent::None, AttachmentContent::Binary)
+            }
         };
 
         Ok(Self {

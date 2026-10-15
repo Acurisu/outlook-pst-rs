@@ -1,5 +1,5 @@
 use super::{
-    attachment::AttachmentMethod,
+    attachment::{Attachment, AttachmentMethod},
     store::{Store, UnicodeStore},
 };
 use crate::{
@@ -198,20 +198,53 @@ fn object_heap(method: AttachmentMethod) -> Vec<u8> {
     ])
 }
 
+/// The message store's properties: just the record key that entry IDs need.
+fn store_heap() -> Vec<u8> {
+    heap(vec![(
+        0x0FF9,
+        PropertyType::Binary,
+        Value::Bytes(vec![7; 16]),
+    )])
+}
+
+/// Opens the only attachment of a message, with the given attachment properties.
+fn single_attachment(properties: Vec<(u16, PropertyType, Value)>) -> Rc<dyn Attachment> {
+    let mut f = Fixture::new();
+    let store = f.block(store_heap(), false);
+    let attachment = f.block(heap(properties), false);
+    let subnodes = f.subnodes(vec![UnicodeLeafSubNodeTreeEntry::new(
+        attachment_id(),
+        attachment,
+        None,
+    )]);
+    let message = f.block(
+        heap(vec![(0x0E07, PropertyType::Integer32, Value::Small(0))]),
+        false,
+    );
+    let store = f.finish(
+        vec![
+            UnicodeNodeBTreeEntry::new(NID_MESSAGE_STORE, store, None, None),
+            UnicodeNodeBTreeEntry::new(message_id(), message, Some(subnodes), None),
+        ],
+        ReadControl::default(),
+    );
+    store
+        .open_message(
+            &store.properties().make_entry_id(message_id()).unwrap(),
+            None,
+        )
+        .unwrap()
+        .open_attachment(attachment_id(), None)
+        .unwrap()
+}
+
 fn fixture(control: ReadControl) -> Rc<dyn Store> {
     fixture_with_leaf(control, false, b"preserved nested attachment bytes")
 }
 
 fn fixture_with_leaf(control: ReadControl, leaf: bool, payload: &[u8]) -> Rc<dyn Store> {
     let mut f = Fixture::new();
-    let store = f.block(
-        heap(vec![(
-            0x0FF9,
-            PropertyType::Binary,
-            Value::Bytes(vec![7; 16]),
-        )]),
-        false,
-    );
+    let store = f.block(store_heap(), false);
     let payload_node = NodeId::new(NodeIdType::ListsTablesProperties, 0x200).unwrap();
     let payload = f.block(payload.to_vec(), false);
     let payload_tree = f.subnodes(vec![UnicodeLeafSubNodeTreeEntry::new(
@@ -344,6 +377,44 @@ fn object_safe_nested_attachments_preserve_payload_and_metadata() {
     let mut second = Vec::new();
     attachment.copy_data(&mut second).unwrap();
     assert_eq!(bytes, second);
+}
+
+#[test]
+fn optional_binary_data_is_preserved_for_reference_methods() {
+    for method in [
+        AttachmentMethod::None,
+        AttachmentMethod::ByReference,
+        AttachmentMethod::ByReferenceOnly,
+        AttachmentMethod::ByWebReference,
+    ] {
+        for payload in [None, Some(&b""[..]), Some(&b"reference payload"[..])] {
+            let mut properties =
+                vec![(0x3705, PropertyType::Integer32, Value::Small(method as u32))];
+            if let Some(payload) = payload {
+                // An empty variable-size value is stored as heap ID 0.
+                let value = if payload.is_empty() {
+                    Value::Small(0)
+                } else {
+                    Value::Bytes(payload.to_vec())
+                };
+                properties.push((0x3701, PropertyType::Binary, value));
+            }
+            let attachment = single_attachment(properties);
+            assert!(attachment.embedded_message().is_none());
+            let mut output = Vec::new();
+            let copied = attachment.copy_data(&mut output).unwrap();
+            assert_eq!(
+                copied,
+                payload.map(|bytes| bytes.len() as u64),
+                "{method:?} {payload:?}"
+            );
+            assert_eq!(
+                output,
+                payload.unwrap_or_default(),
+                "{method:?} {payload:?}"
+            );
+        }
+    }
 }
 
 #[test]
