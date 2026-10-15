@@ -1,7 +1,12 @@
 //! ## [Messaging Layer](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/3f1bc553-d15d-4dcf-9b80-fbf1dd6c7e79)
 
-use std::io;
+use std::{collections::BTreeMap, io};
 use thiserror::Error;
+
+use crate::{
+    ltp::prop_context::PropertyValue,
+    read_control::{ReadControl, MAP_ENTRY_OVERHEAD},
+};
 
 pub mod attachment;
 pub mod folder;
@@ -11,6 +16,41 @@ pub mod search;
 pub mod store;
 
 pub(crate) mod read_write;
+
+#[cfg(test)]
+mod tests;
+
+fn collect_properties(
+    properties: impl IntoIterator<Item = io::Result<(u16, PropertyValue)>>,
+    control: &ReadControl,
+) -> io::Result<BTreeMap<u16, PropertyValue>> {
+    let mut result = BTreeMap::new();
+    let mut retained = 0;
+    for property in properties {
+        control.charge(1)?;
+        let (id, value) = property?;
+        retain_property(&mut result, &mut retained, id, value, control)?;
+    }
+    Ok(result)
+}
+
+/// Inserts a decoded property, keeping the bytes retained by the whole map within the
+/// allocation limit.
+fn retain_property(
+    properties: &mut BTreeMap<u16, PropertyValue>,
+    retained: &mut usize,
+    id: u16,
+    value: PropertyValue,
+    control: &ReadControl,
+) -> io::Result<()> {
+    let size = retained
+        .saturating_add(value.allocation_size())
+        .saturating_add(MAP_ENTRY_OVERHEAD);
+    control.check_allocation(size)?;
+    properties.insert(id, value);
+    *retained = size;
+    Ok(())
+}
 
 #[derive(Error, Debug)]
 pub enum MessagingError {

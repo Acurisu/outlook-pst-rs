@@ -523,7 +523,8 @@ where
 
             let mut page_cache = pst.node_cache();
             let node_key: <Pst as PstFile>::BTreeKey = u32::from(NID_NAME_TO_ID_MAP).into();
-            let node = node_btree.find_entry(file, node_key, &mut page_cache)?;
+            let node =
+                node_btree.find_entry(file, node_key, &mut page_cache, pst.read_control())?;
 
             let mut page_cache = pst.block_cache();
             let data = node.data();
@@ -533,6 +534,7 @@ where
                 &mut page_cache,
                 encoding,
                 data.search_key(),
+                pst.read_control(),
             )?;
             let header = heap.header()?;
 
@@ -540,15 +542,17 @@ where
             let prop_context = <<Pst as PstFile>::PropertyContext as PropertyContextReadWrite<
                 Pst,
             >>::new(node, tree);
-            let properties = prop_context
-                .properties()?
-                .into_iter()
-                .map(|(prop_id, record)| {
-                    prop_context
-                        .read_property(file, encoding, &block_btree, &mut page_cache, record)
-                        .map(|value| (prop_id, value))
-                })
-                .collect::<io::Result<BTreeMap<_, _>>>()?;
+            let properties = collect_properties(
+                prop_context
+                    .properties()?
+                    .into_iter()
+                    .map(|(prop_id, record)| {
+                        prop_context
+                            .read_property(file, encoding, &block_btree, &mut page_cache, record)
+                            .map(|value| (prop_id, value))
+                    }),
+                pst.read_control(),
+            )?;
             NamedPropertyMapProperties { properties }
         };
 

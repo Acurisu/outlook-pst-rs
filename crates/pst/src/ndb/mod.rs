@@ -115,6 +115,13 @@ pub enum NdbError {
     SubNodeNotFound(NodeId),
 }
 
+impl NdbError {
+    /// Recovers the `NdbError` wrapped by an `io::Error`, if any.
+    pub fn from_io(error: &io::Error) -> Option<&Self> {
+        error.get_ref()?.downcast_ref()
+    }
+}
+
 impl From<NdbError> for io::Error {
     fn from(err: NdbError) -> io::Error {
         io::Error::new(io::ErrorKind::InvalidData, err)

@@ -1,8 +1,13 @@
 //! ## [Message Objects](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/1042af37-aaa4-4edc-bffd-90a1ede24188)
 
-use std::{collections::BTreeMap, io, rc::Rc};
+use std::{collections::BTreeMap, io, mem, rc::Rc};
 
-use super::{read_write::*, store::*, *};
+use super::{
+    attachment::{AnsiAttachment, Attachment, UnicodeAttachment},
+    read_write::*,
+    store::*,
+    *,
+};
 use crate::{
     ltp::{
         heap::HeapNode,
@@ -20,6 +25,7 @@ use crate::{
         read_write::*,
         root::Root,
     },
+    read_control::MAP_ENTRY_OVERHEAD,
     AnsiPstFile, PstFile, PstFileLock, UnicodePstFile,
 };
 
@@ -137,6 +143,14 @@ pub trait Message {
     fn properties(&self) -> &MessageProperties;
     fn recipient_table(&self) -> Option<&Rc<dyn TableContext>>;
     fn attachment_table(&self) -> Option<&Rc<dyn TableContext>>;
+    /// Opens an attachment in this message's own subnode namespace, including on
+    /// embedded messages returned as trait objects. `prop_ids` selects properties
+    /// of an embedded message; attachment metadata remains available in full.
+    fn open_attachment(
+        self: Rc<Self>,
+        sub_node: NodeId,
+        prop_ids: Option<&[u16]>,
+    ) -> io::Result<Rc<dyn Attachment>>;
 }
 
 struct MessageInner<Pst>
@@ -148,6 +162,7 @@ where
     sub_nodes: MessageSubNodes<Pst>,
     recipient_table: Option<Rc<dyn TableContext>>,
     attachment_table: Option<Rc<dyn TableContext>>,
+    depth: usize,
 }
 
 impl<Pst> MessageInner<Pst>
@@ -225,18 +240,22 @@ where
 
             let mut page_cache = pst.node_cache();
             let node_key: <Pst as PstFile>::BTreeKey = u32::from(node_id).into();
-            node_btree.find_entry(file, node_key, &mut page_cache)?
+            node_btree.find_entry(file, node_key, &mut page_cache, pst.read_control())?
         };
 
-        Self::read_embedded(store, node, prop_ids)
+        Self::read_embedded(store, node, prop_ids, 0)
     }
 
     fn read_embedded(
         store: Rc<<Pst as PstFile>::Store>,
         node: <Pst as PstFile>::NodeBTreeEntry,
         prop_ids: Option<&[u16]>,
+        depth: usize,
     ) -> io::Result<Self> {
         let pst = store.pst();
+        let control = pst.read_control();
+        control.charge(1)?;
+        control.check_depth(depth)?;
         let header = pst.header();
         let root = header.root();
 
@@ -253,10 +272,6 @@ where
                 *root.block_btree(),
             )?;
 
-            let sub_node = node
-                .sub_node()
-                .ok_or(MessagingError::MessageSubNodeTreeNotFound)?;
-
             let mut page_cache = pst.block_cache();
             let data = node.data();
             let heap = <<Pst as PstFile>::HeapNode as HeapNodeReadWrite<Pst>>::read(
@@ -265,29 +280,54 @@ where
                 &mut page_cache,
                 encoding,
                 data.search_key(),
+                control,
             )?;
             let header = heap.header()?;
 
             let tree = <Pst as PstFile>::PropertyTree::new(heap, header.user_root());
             let prop_context = <Pst as PstFile>::PropertyContext::new(node, tree);
-            let properties = prop_context
-                .properties()?
-                .into_iter()
-                .filter(|(prop_id, _)| prop_ids.is_none_or(|ids| ids.contains(prop_id)))
-                .map(|(prop_id, record)| {
-                    prop_context
-                        .read_property(file, encoding, &block_btree, &mut page_cache, record)
-                        .map(|value| (prop_id, value))
-                })
-                .collect::<io::Result<BTreeMap<_, _>>>()?;
+            let properties = collect_properties(
+                prop_context
+                    .properties()?
+                    .into_iter()
+                    .filter(|(prop_id, _)| prop_ids.is_none_or(|ids| ids.contains(prop_id)))
+                    .map(|(prop_id, record)| {
+                        prop_context
+                            .read_property(file, encoding, &block_btree, &mut page_cache, record)
+                            .map(|value| (prop_id, value))
+                    }),
+                control,
+            )?;
             let properties = MessageProperties { properties };
 
-            let block = block_btree.find_entry(file, sub_node.search_key(), &mut page_cache)?;
-            let sub_nodes = SubNodeTree::<Pst>::read(file, &block)?;
-            let sub_nodes: BTreeMap<_, _> = sub_nodes
-                .entries(file, &block_btree, &mut page_cache)?
-                .map(|entry| (entry.node(), entry))
-                .collect();
+            let sub_nodes = match node.sub_node() {
+                Some(sub_node) => {
+                    let block = block_btree.find_entry(
+                        file,
+                        sub_node.search_key(),
+                        &mut page_cache,
+                        control,
+                    )?;
+                    let entries = SubNodeTree::<Pst>::read(file, &block, control)?.entries(
+                        file,
+                        &block_btree,
+                        &mut page_cache,
+                        control,
+                    )?;
+                    let entry_size = mem::size_of::<(NodeId, LeafSubNodeTreeEntry<Pst::BlockId>)>()
+                        + MAP_ENTRY_OVERHEAD;
+                    let mut sub_nodes = BTreeMap::new();
+                    for entry in entries {
+                        entry.node().id_type()?;
+                        control
+                            .check_allocation((sub_nodes.len() + 1).saturating_mul(entry_size))?;
+                        sub_nodes.insert(entry.node(), entry);
+                    }
+                    sub_nodes
+                }
+                // A message without recipients or attachments may have no subnodes.
+                None => BTreeMap::new(),
+            };
 
             (properties, sub_nodes)
         };
@@ -351,6 +391,7 @@ where
             sub_nodes,
             recipient_table,
             attachment_table,
+            depth,
         })
     }
 }
@@ -389,6 +430,16 @@ impl Message for UnicodeMessage {
     fn attachment_table(&self) -> Option<&Rc<dyn TableContext>> {
         self.inner.attachment_table.as_ref()
     }
+
+    fn open_attachment(
+        self: Rc<Self>,
+        sub_node: NodeId,
+        prop_ids: Option<&[u16]>,
+    ) -> io::Result<Rc<dyn Attachment>> {
+        let attachment: Rc<UnicodeAttachment> =
+            AttachmentReadWrite::<UnicodePstFile>::read(self, sub_node, prop_ids)?;
+        Ok(attachment)
+    }
 }
 
 impl MessageReadWrite<UnicodePstFile> for UnicodeMessage {
@@ -405,8 +456,9 @@ impl MessageReadWrite<UnicodePstFile> for UnicodeMessage {
         store: Rc<UnicodeStore>,
         node: UnicodeNodeBTreeEntry,
         prop_ids: Option<&[u16]>,
+        depth: usize,
     ) -> io::Result<Rc<Self>> {
-        let inner = MessageInner::read_embedded(store, node, prop_ids)?;
+        let inner = MessageInner::read_embedded(store, node, prop_ids, depth)?;
         Ok(Rc::new(Self { inner }))
     }
 
@@ -416,6 +468,10 @@ impl MessageReadWrite<UnicodePstFile> for UnicodeMessage {
 
     fn sub_nodes(&self) -> &UnicodeMessageSubNodes {
         &self.inner.sub_nodes
+    }
+
+    fn depth(&self) -> usize {
+        self.inner.depth
     }
 }
 
@@ -449,6 +505,16 @@ impl Message for AnsiMessage {
     fn attachment_table(&self) -> Option<&Rc<dyn TableContext>> {
         self.inner.attachment_table.as_ref()
     }
+
+    fn open_attachment(
+        self: Rc<Self>,
+        sub_node: NodeId,
+        prop_ids: Option<&[u16]>,
+    ) -> io::Result<Rc<dyn Attachment>> {
+        let attachment: Rc<AnsiAttachment> =
+            AttachmentReadWrite::<AnsiPstFile>::read(self, sub_node, prop_ids)?;
+        Ok(attachment)
+    }
 }
 
 impl MessageReadWrite<AnsiPstFile> for AnsiMessage {
@@ -465,8 +531,9 @@ impl MessageReadWrite<AnsiPstFile> for AnsiMessage {
         store: Rc<AnsiStore>,
         node: AnsiNodeBTreeEntry,
         prop_ids: Option<&[u16]>,
+        depth: usize,
     ) -> io::Result<Rc<Self>> {
-        let inner = MessageInner::read_embedded(store, node, prop_ids)?;
+        let inner = MessageInner::read_embedded(store, node, prop_ids, depth)?;
         Ok(Rc::new(Self { inner }))
     }
 
@@ -476,5 +543,9 @@ impl MessageReadWrite<AnsiPstFile> for AnsiMessage {
 
     fn sub_nodes(&self) -> &AnsiMessageSubNodes {
         &self.inner.sub_nodes
+    }
+
+    fn depth(&self) -> usize {
+        self.inner.depth
     }
 }

@@ -37,9 +37,11 @@ where
         store: Rc<Pst::Store>,
         node: Pst::NodeBTreeEntry,
         prop_ids: Option<&[u16]>,
+        depth: usize,
     ) -> io::Result<Rc<Self>>;
     fn pst_store(&self) -> &Rc<Pst::Store>;
     fn sub_nodes(&self) -> &MessageSubNodes<Pst>;
+    fn depth(&self) -> usize;
 }
 
 pub trait AttachmentReadWrite<Pst>: Sized

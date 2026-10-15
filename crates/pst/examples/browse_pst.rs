@@ -72,13 +72,17 @@ impl IpmSubTree {
                     .get_or_init(|| {
                         let ipm_sub_tree = self.store().properties().ipm_sub_tree_entry_id()?;
                         let ipm_subtree_folder = self.store().open_folder(&ipm_sub_tree)?;
-                        let hierarchy_table = ipm_subtree_folder.hierarchy_table().ok_or(
-                            anyhow::anyhow!("No hierarchy table found for the IPM Subtree."),
-                        )?;
+                        let hierarchy_table =
+                            ipm_subtree_folder
+                                .hierarchy_table()?
+                                .ok_or(anyhow::anyhow!(
+                                    "No hierarchy table found for the IPM Subtree."
+                                ))?;
 
                         hierarchy_table
                             .rows_matrix()
                             .map(|row| {
+                                let row = row?;
                                 let node = NodeId::from(u32::from(row.id()));
                                 let entry_id = self.store().properties().make_entry_id(node)?;
                                 Ok(self.store().open_folder(&entry_id)?)
@@ -130,13 +134,14 @@ impl Folder {
                 let mut sub_folders =
                     self.pst_sub_folders
                         .get_or_init(|| {
-                            let hierarchy_table = self.pst_folder.hierarchy_table().ok_or(
+                            let hierarchy_table = self.pst_folder.hierarchy_table()?.ok_or(
                                 anyhow::anyhow!("No hierarchy table found for the folder."),
                             )?;
 
                             hierarchy_table
                                 .rows_matrix()
                                 .map(|row| {
+                                    let row = row?;
                                     let node = NodeId::from(u32::from(row.id()));
                                     let entry_id =
                                         self.pst_folder.store().properties().make_entry_id(node)?;
@@ -164,15 +169,16 @@ impl Folder {
             .get_or_init(|| {
                 let contents_table = self
                     .pst_folder
-                    .contents_table()
+                    .contents_table()?
                     .ok_or(anyhow::anyhow!("No contents table found for the folder."))?;
                 contents_table
                     .rows_matrix()
                     .map(|row| {
+                        let row = row?;
                         Message::new(
                             self.pst_folder.store().clone(),
                             contents_table.as_ref(),
-                            row,
+                            &row,
                         )
                     })
                     .collect::<anyhow::Result<Vec<_>>>()
@@ -194,7 +200,7 @@ enum MessageOrRow {
 struct Message {
     entry_id: EntryId,
     message: MessageOrRow,
-    recipients: OnceCell<Vec<Recipient>>,
+    recipients: OnceCell<anyhow::Result<Vec<Recipient>>>,
     body: OnceCell<anyhow::Result<Option<Body>>>,
     attachments: OnceCell<anyhow::Result<Vec<Attachment>>>,
     pst_store: Rc<dyn Store>,
@@ -334,65 +340,50 @@ impl Message {
         Ok(self
             .recipients
             .get_or_init(|| {
-                let Ok(message) = self.message() else {
-                    return Default::default();
-                };
+                let message = self.message()?;
 
                 let Some(recipient_table) = message.recipient_table() else {
-                    return Default::default();
+                    return Ok(Vec::new());
                 };
-                let context = recipient_table.context();
-
-                recipient_table
+                Ok(recipient_table
                     .rows_matrix()
                     .filter_map(|row| {
-                        let columns: Vec<_> = context
-                            .columns()
-                            .iter()
-                            .zip(row.columns(context).ok()?)
-                            .collect();
-                        let recipient_type = match columns
-                            .iter()
-                            .find_map(|(col, value)| {
-                                if col.prop_id() == 0x0C15 {
-                                    Some((value.as_ref(), col.prop_type()))
-                                } else {
-                                    None
-                                }
-                            })
-                            .and_then(|(value, prop_type)| {
-                                recipient_table.read_column(value?, prop_type).ok()
-                            })? {
-                            PropertyValue::Integer32(value) => value,
-                            _ => return None,
-                        };
-                        let display_name = match columns
-                            .iter()
-                            .find_map(|(col, value)| {
-                                if col.prop_id() == 0x3001 {
-                                    Some((value.as_ref(), col.prop_type()))
-                                } else {
-                                    None
-                                }
-                            })
-                            .and_then(|(value, prop_type)| {
-                                recipient_table.read_column(value?, prop_type).ok()
-                            })? {
-                            PropertyValue::String8(value) => value.to_string(),
-                            PropertyValue::Unicode(value) => value.to_string(),
-                            _ => return None,
-                        };
-
-                        match recipient_type {
-                            MAPI_TO => Some(Recipient::To(display_name)),
-                            MAPI_CC => Some(Recipient::Cc(display_name)),
-                            MAPI_BCC => Some(Recipient::Bcc(display_name)),
-                            _ => None,
-                        }
+                        row.map(|row| read_recipient(recipient_table.as_ref(), &row))
+                            .transpose()
                     })
-                    .collect()
+                    .collect::<io::Result<_>>()?)
             })
+            .as_ref()
+            .map_err(|err| anyhow::anyhow!("{err:?}"))?
             .as_slice())
+    }
+}
+
+/// Decodes a recipient row, skipping rows without a readable type and display name.
+fn read_recipient(table: &dyn TableContext, row: &TableRowData) -> Option<Recipient> {
+    let context = table.context();
+    let columns = row.columns(context).ok()?;
+    let read = |prop_id| {
+        let (column, value) = context
+            .columns()
+            .iter()
+            .zip(&columns)
+            .find(|(column, _)| column.prop_id() == prop_id)?;
+        table.read_column(value.as_ref()?, column.prop_type()).ok()
+    };
+    let PropertyValue::Integer32(recipient_type) = read(0x0C15)? else {
+        return None;
+    };
+    let display_name = match read(0x3001)? {
+        PropertyValue::String8(value) => value.to_string(),
+        PropertyValue::Unicode(value) => value.to_string(),
+        _ => return None,
+    };
+    match recipient_type {
+        MAPI_TO => Some(Recipient::To(display_name)),
+        MAPI_CC => Some(Recipient::Cc(display_name)),
+        MAPI_BCC => Some(Recipient::Bcc(display_name)),
+        _ => None,
     }
 }
 

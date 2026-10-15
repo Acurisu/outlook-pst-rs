@@ -18,6 +18,7 @@ use crate::{
         page::{BTreePage, NodeBTreeEntry, RootBTree},
         read_write::*,
         root::Root,
+        NdbError,
     },
     AnsiPstFile, PstFile, PstFileLock, UnicodePstFile,
 };
@@ -102,9 +103,9 @@ impl FolderProperties {
 pub trait Folder {
     fn store(&self) -> Rc<dyn Store>;
     fn properties(&self) -> &FolderProperties;
-    fn hierarchy_table(&self) -> Option<&Rc<dyn TableContext>>;
-    fn contents_table(&self) -> Option<&Rc<dyn TableContext>>;
-    fn associated_table(&self) -> Option<&Rc<dyn TableContext>>;
+    fn hierarchy_table(&self) -> io::Result<Option<&Rc<dyn TableContext>>>;
+    fn contents_table(&self) -> io::Result<Option<&Rc<dyn TableContext>>>;
+    fn associated_table(&self) -> io::Result<Option<&Rc<dyn TableContext>>>;
 }
 
 struct FolderInner<Pst>
@@ -187,7 +188,8 @@ where
 
             let mut node_page_cache = pst.node_cache();
             let node_key: <Pst as PstFile>::BTreeKey = u32::from(node_id).into();
-            let node = node_btree.find_entry(file, node_key, &mut node_page_cache)?;
+            let node =
+                node_btree.find_entry(file, node_key, &mut node_page_cache, pst.read_control())?;
             let mut block_page_cache = pst.block_cache();
             let data = node.data();
             let heap = <<Pst as PstFile>::HeapNode as HeapNodeReadWrite<Pst>>::read(
@@ -196,6 +198,7 @@ where
                 &mut block_page_cache,
                 encoding,
                 data.search_key(),
+                pst.read_control(),
             )?;
             let header = heap.header()?;
 
@@ -209,19 +212,27 @@ where
                 1
             };
             let entry_id = entry_id.try_into()?;
-            let properties = prop_context
-                .properties()?
-                .into_iter()
-                .map(|(prop_id, record)| {
-                    prop_context
-                        .read_property(file, encoding, &block_btree, &mut block_page_cache, record)
-                        .map(|value| (prop_id, value))
-                })
-                .chain([
-                    Ok((0x0FFF, PropertyValue::Binary(BinaryValue::new(entry_id)))),
-                    Ok((0x3601, PropertyValue::Integer32(folder_type))),
-                ])
-                .collect::<io::Result<BTreeMap<_, _>>>()?;
+            let properties = collect_properties(
+                prop_context
+                    .properties()?
+                    .into_iter()
+                    .map(|(prop_id, record)| {
+                        prop_context
+                            .read_property(
+                                file,
+                                encoding,
+                                &block_btree,
+                                &mut block_page_cache,
+                                record,
+                            )
+                            .map(|value| (prop_id, value))
+                    })
+                    .chain([
+                        Ok((0x0FFF, PropertyValue::Binary(BinaryValue::new(entry_id)))),
+                        Ok((0x3601, PropertyValue::Integer32(folder_type))),
+                    ]),
+                pst.read_control(),
+            )?;
 
             FolderProperties {
                 node_id,
@@ -259,10 +270,18 @@ where
             let node_key: <Pst as PstFile>::BTreeKey = u32::from(node_id).into();
             let mut node_page_cache = pst.node_cache();
 
-            let Ok(node) = node_btree.find_entry(file, node_key, &mut node_page_cache) else {
-                return Ok(None);
-            };
-            node
+            match node_btree.find_entry(file, node_key, &mut node_page_cache, pst.read_control()) {
+                Ok(node) => node,
+                Err(error)
+                    if matches!(
+                        NdbError::from_io(&error),
+                        Some(NdbError::BTreePageNotFound(key)) if *key == u64::from(u32::from(node_id))
+                    ) =>
+                {
+                    return Ok(None)
+                }
+                Err(error) => return Err(error),
+            }
         };
 
         Ok(Some(
@@ -273,22 +292,29 @@ where
         ))
     }
 
-    fn hierarchy_table(&self) -> Option<&Rc<dyn TableContext>> {
-        self.hierarchy_table
-            .get_or_init(|| self.read_table(NodeIdType::HierarchyTable).ok()?)
-            .as_ref()
+    fn table<'a>(
+        &self,
+        cache: &'a OnceCell<Option<Rc<dyn TableContext>>>,
+        node_id_type: NodeIdType,
+    ) -> io::Result<Option<&'a Rc<dyn TableContext>>> {
+        self.store.pst().read_control().check()?;
+        if cache.get().is_none() {
+            let table = self.read_table(node_id_type)?;
+            let _ = cache.set(table);
+        }
+        Ok(cache.get().and_then(Option::as_ref))
     }
 
-    fn contents_table(&self) -> Option<&Rc<dyn TableContext>> {
-        self.contents_table
-            .get_or_init(|| self.read_table(NodeIdType::ContentsTable).ok()?)
-            .as_ref()
+    fn hierarchy_table(&self) -> io::Result<Option<&Rc<dyn TableContext>>> {
+        self.table(&self.hierarchy_table, NodeIdType::HierarchyTable)
     }
 
-    fn associated_table(&self) -> Option<&Rc<dyn TableContext>> {
-        self.associated_table
-            .get_or_init(|| self.read_table(NodeIdType::AssociatedContentsTable).ok()?)
-            .as_ref()
+    fn contents_table(&self) -> io::Result<Option<&Rc<dyn TableContext>>> {
+        self.table(&self.contents_table, NodeIdType::ContentsTable)
+    }
+
+    fn associated_table(&self) -> io::Result<Option<&Rc<dyn TableContext>>> {
+        self.table(&self.associated_table, NodeIdType::AssociatedContentsTable)
     }
 }
 
@@ -311,15 +337,15 @@ impl Folder for UnicodeFolder {
         &self.inner.properties
     }
 
-    fn hierarchy_table(&self) -> Option<&Rc<dyn TableContext>> {
+    fn hierarchy_table(&self) -> io::Result<Option<&Rc<dyn TableContext>>> {
         self.inner.hierarchy_table()
     }
 
-    fn contents_table(&self) -> Option<&Rc<dyn TableContext>> {
+    fn contents_table(&self) -> io::Result<Option<&Rc<dyn TableContext>>> {
         self.inner.contents_table()
     }
 
-    fn associated_table(&self) -> Option<&Rc<dyn TableContext>> {
+    fn associated_table(&self) -> io::Result<Option<&Rc<dyn TableContext>>> {
         self.inner.associated_table()
     }
 }
@@ -350,15 +376,15 @@ impl Folder for AnsiFolder {
         &self.inner.properties
     }
 
-    fn hierarchy_table(&self) -> Option<&Rc<dyn TableContext>> {
+    fn hierarchy_table(&self) -> io::Result<Option<&Rc<dyn TableContext>>> {
         self.inner.hierarchy_table()
     }
 
-    fn contents_table(&self) -> Option<&Rc<dyn TableContext>> {
+    fn contents_table(&self) -> io::Result<Option<&Rc<dyn TableContext>>> {
         self.inner.contents_table()
     }
 
-    fn associated_table(&self) -> Option<&Rc<dyn TableContext>> {
+    fn associated_table(&self) -> io::Result<Option<&Rc<dyn TableContext>>> {
         self.inner.associated_table()
     }
 }

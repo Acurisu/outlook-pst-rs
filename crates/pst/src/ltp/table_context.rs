@@ -2,11 +2,9 @@
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::{
-    cell::RefCell,
-    collections::BTreeMap,
     fmt::Debug,
     io::{self, Cursor, Read, Write},
-    marker::PhantomData,
+    mem,
     rc::Rc,
 };
 
@@ -17,18 +15,15 @@ use crate::{
         store::{AnsiStore, UnicodeStore},
     },
     ndb::{
-        block::{Block, DataBlockCache, DataTree, IntermediateTreeBlock, SubNodeTree},
+        block::{Block, DataTree, IntermediateTreeBlock, SubNodeTree},
         block_id::BlockId,
-        block_ref::BlockRef,
         header::Header,
         node_id::{NodeId, NodeIdType},
-        page::{
-            AnsiNodeBTreeEntry, BlockBTreeEntry, NodeBTreeEntry, RootBTree, UnicodeNodeBTreeEntry,
-        },
+        page::{AnsiNodeBTreeEntry, NodeBTreeEntry, RootBTree, UnicodeNodeBTreeEntry},
         read_write::*,
         root::Root,
     },
-    AnsiPstFile, PstFile, PstFileLock, UnicodePstFile,
+    AnsiPstFile, PstFile, PstFileLock, ReadControl, UnicodePstFile,
 };
 
 pub const LTP_ROW_ID_PROP_ID: u16 = 0x67F2;
@@ -72,7 +67,7 @@ impl TableContextInfo {
             return Err(LtpError::InvalidTableContextColumnCount(columns.len()));
         }
 
-        if end_4byte_values % 4 != 0 {
+        if end_4byte_values < 8 || end_4byte_values % 4 != 0 {
             return Err(LtpError::InvalidTableContext4ByteOffset(end_4byte_values));
         }
 
@@ -159,7 +154,7 @@ impl TableContextInfo {
                 (PropertyType::Integer16, offset)
                     if offset % 2 == 0
                         && offset >= end_4byte_values
-                        && offset + 2 <= end_2byte_values => {}
+                        && u32::from(offset) + 2 <= u32::from(end_2byte_values) => {}
                 (
                     PropertyType::Integer32
                     | PropertyType::Floating32
@@ -182,7 +177,7 @@ impl TableContextInfo {
                     | PropertyType::MultipleGuid
                     | PropertyType::MultipleBinary,
                     offset,
-                ) if offset % 4 == 0 && offset + 4 <= end_4byte_values => {}
+                ) if offset % 4 == 0 && u32::from(offset) + 4 <= u32::from(end_4byte_values) => {}
                 (
                     PropertyType::Floating64
                     | PropertyType::Currency
@@ -190,7 +185,7 @@ impl TableContextInfo {
                     | PropertyType::Integer64
                     | PropertyType::Time,
                     offset,
-                ) if offset % 4 == 0 && offset + 8 <= end_4byte_values => {}
+                ) if offset % 4 == 0 && u32::from(offset) + 8 <= u32::from(end_4byte_values) => {}
                 (_, offset) => {
                     return Err(LtpError::InvalidTableColumnOffset(offset));
                 }
@@ -235,7 +230,7 @@ impl TableContextInfo {
                 }
             }
 
-            if usize::from(column.existence_bitmap_index()) > columns.len() {
+            if usize::from(column.existence_bitmap_index()) >= columns.len() {
                 return Err(LtpError::InvalidTableColumnBitmaskOffset(
                     column.existence_bitmap_index(),
                 ));
@@ -469,21 +464,9 @@ impl HeapNodePageReadWrite for TableRowId {
     }
 }
 
-trait TableRowIndex<Pst>: HeapTreeEntryValue + HeapNodePageReadWrite + Copy
-where
-    Pst: PstFile,
-    u32: From<Self>,
-{
-    type Index: Copy;
-}
-
 #[derive(Clone, Copy, Default, Debug)]
 pub struct UnicodeTableRowIndex {
     index: u32,
-}
-
-impl TableRowIndex<UnicodePstFile> for UnicodeTableRowIndex {
-    type Index = u32;
 }
 
 impl From<UnicodeTableRowIndex> for u32 {
@@ -512,10 +495,6 @@ pub struct AnsiTableRowIndex {
     index: u16,
 }
 
-impl TableRowIndex<AnsiPstFile> for AnsiTableRowIndex {
-    type Index = u16;
-}
-
 impl From<AnsiTableRowIndex> for u32 {
     fn from(value: AnsiTableRowIndex) -> Self {
         u32::from(value.index)
@@ -535,14 +514,6 @@ impl HeapNodePageReadWrite for AnsiTableRowIndex {
     fn write(&self, f: &mut dyn Write) -> io::Result<()> {
         f.write_u16::<LittleEndian>(self.index)
     }
-}
-
-trait TableRowIndexTree<Pst>: HeapTreeReadWrite<Pst, Key = TableRowId, Value = Self::RowIndex>
-where
-    Pst: PstFile,
-    u32: From<Self::RowIndex>,
-{
-    type RowIndex: TableRowIndex<Pst>;
 }
 
 /// [TCROWID](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/e20b5cf4-ea56-48b8-a8fa-e086c9b862ca)
@@ -782,17 +753,30 @@ impl TableRowReadWrite for TableRowData {
 
         // rgdwData
         let unique = f.read_u32::<LittleEndian>()?;
-        let mut align_4byte = vec![0; context.end_4byte_values() as usize - 8];
+        let size = context.end_4byte_values().checked_sub(8).ok_or(
+            LtpError::InvalidTableContext4ByteOffset(context.end_4byte_values()),
+        )?;
+        let mut align_4byte = vec![0; usize::from(size)];
         f.read_exact(align_4byte.as_mut_slice())?;
 
         // rgwData
-        let mut align_2byte =
-            vec![0; (context.end_2byte_values() - context.end_4byte_values()) as usize];
+        let size = context
+            .end_2byte_values()
+            .checked_sub(context.end_4byte_values())
+            .ok_or(LtpError::InvalidTableContext2ByteOffset(
+                context.end_2byte_values(),
+            ))?;
+        let mut align_2byte = vec![0; usize::from(size)];
         f.read_exact(align_2byte.as_mut_slice())?;
 
         // rgbData
-        let mut align_1byte =
-            vec![0; (context.end_1byte_values() - context.end_2byte_values()) as usize];
+        let size = context
+            .end_1byte_values()
+            .checked_sub(context.end_2byte_values())
+            .ok_or(LtpError::InvalidTableContext1ByteOffset(
+                context.end_1byte_values(),
+            ))?;
+        let mut align_1byte = vec![0; usize::from(size)];
         f.read_exact(align_1byte.as_mut_slice())?;
 
         // rgbCEB
@@ -821,8 +805,8 @@ impl TableRowReadWrite for TableRowData {
 
 pub trait TableContext {
     fn context(&self) -> &TableContextInfo;
-    fn rows_matrix<'a>(&'a self) -> Box<dyn 'a + Iterator<Item = &'a TableRowData>>;
-    fn find_row(&self, id: TableRowId) -> LtpResult<&TableRowData>;
+    fn rows_matrix<'a>(&'a self) -> Box<dyn 'a + Iterator<Item = io::Result<TableRowData>>>;
+    fn find_row(&self, id: TableRowId) -> io::Result<TableRowData>;
     fn read_column(
         &self,
         value: &TableRowColumnValue,
@@ -830,27 +814,119 @@ pub trait TableContext {
     ) -> io::Result<PropertyValue>;
 }
 
-struct TableContextInner<Pst, RowIndex, RowIndexTree>
+/// One block of the row matrix: a heap allocation or a data-tree leaf.
+enum TableRowBlock<'a, Pst: PstFile> {
+    Heap(&'a [u8]),
+    Data(<Pst as PstFile>::DataBlock),
+}
+
+impl<Pst: PstFile> TableRowBlock<'_, Pst> {
+    fn data(&self) -> &[u8] {
+        match self {
+            Self::Heap(data) => data,
+            Self::Data(block) => block.data(),
+        }
+    }
+}
+
+fn row_width(context: &TableContextInfo) -> io::Result<usize> {
+    match usize::from(context.end_existence_bitmap()) {
+        0 => Err(LtpError::InvalidTableContextBitmaskOffset(0).into()),
+        width => Ok(width),
+    }
+}
+
+/// Decodes rows one block at a time and stops after the first error.
+struct TableRows<'a, Pst: PstFile, F> {
+    context: &'a TableContextInfo,
+    control: &'a ReadControl,
+    next_block: F,
+    block: Option<TableRowBlock<'a, Pst>>,
+    offset: usize,
+    done: bool,
+}
+
+fn table_rows<'a, Pst, F>(
+    context: &'a TableContextInfo,
+    control: &'a ReadControl,
+    next_block: F,
+) -> TableRows<'a, Pst, F>
 where
     Pst: PstFile,
-    RowIndex: TableRowIndex<Pst>,
-    RowIndexTree: TableRowIndexTree<Pst, RowIndex = RowIndex>,
-    u32: From<RowIndex>,
+    F: FnMut() -> io::Result<Option<TableRowBlock<'a, Pst>>>,
+{
+    TableRows {
+        context,
+        control,
+        next_block,
+        block: None,
+        offset: 0,
+        done: false,
+    }
+}
+
+impl<'a, Pst, F> TableRows<'a, Pst, F>
+where
+    Pst: PstFile,
+    F: FnMut() -> io::Result<Option<TableRowBlock<'a, Pst>>>,
+{
+    fn next_row(&mut self) -> io::Result<Option<TableRowData>> {
+        self.control.charge(1)?;
+        let width = row_width(self.context)?;
+        self.control.check_allocation(width)?;
+        loop {
+            // Rows do not span blocks. A remainder shorter than a row is block padding.
+            if let Some(row) = self
+                .block
+                .as_ref()
+                .and_then(|block| block.data().get(self.offset..self.offset + width))
+            {
+                self.offset += width;
+                return TableRowData::read(&mut Cursor::new(row), self.context).map(Some);
+            }
+            self.block = (self.next_block)()?;
+            self.offset = 0;
+            if self.block.is_none() {
+                return Ok(None);
+            }
+        }
+    }
+}
+
+impl<'a, Pst, F> Iterator for TableRows<'a, Pst, F>
+where
+    Pst: PstFile,
+    F: FnMut() -> io::Result<Option<TableRowBlock<'a, Pst>>>,
+{
+    type Item = io::Result<TableRowData>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        let row = self.next_row().transpose();
+        self.done = !matches!(row, Some(Ok(_)));
+        row
+    }
+}
+
+struct TableContextInner<Pst>
+where
+    Pst: PstFile,
 {
     store: Rc<<Pst as PstFile>::Store>,
     node: <Pst as PstFile>::NodeBTreeEntry,
     context: TableContextInfo,
     heap: <Pst as PstFile>::HeapNode,
-    row_index: BTreeMap<TableRowId, RowIndex>,
-    rows: Vec<TableRowData>,
-    block_cache: RefCell<DataBlockCache<Pst>>,
-    _phantom: PhantomData<RowIndexTree>,
+    rows: Option<DataTree<Pst>>,
 }
 
-impl<Pst, RowIndex, RowIndexTree> TableContextInner<Pst, RowIndex, RowIndexTree>
+impl<Pst> TableContextInner<Pst>
 where
     Pst: PstFile + PstFileLock<Pst>,
     <Pst as PstFile>::BlockId: BlockId<Index = <Pst as PstFile>::BTreeKey> + BlockIdReadWrite,
+    <Pst as PstFile>::BlockRef: BlockRefReadWrite,
+    <Pst as PstFile>::PageTrailer: PageTrailerReadWrite,
     <Pst as PstFile>::ByteIndex: ByteIndexReadWrite,
     <Pst as PstFile>::BTreeKey: BTreePageKeyReadWrite,
     <Pst as PstFile>::BlockBTree: RootBTreeReadWrite,
@@ -875,11 +951,8 @@ where
     <Pst as PstFile>::SubNodeBlock: IntermediateTreeBlockReadWrite,
     <<Pst as PstFile>::SubNodeBlock as IntermediateTreeBlock>::Entry:
         IntermediateTreeEntryReadWrite,
-    <Pst as PstFile>::HeapNode: HeapNodeReadWrite<Pst> + From<RowIndexTree>,
+    <Pst as PstFile>::HeapNode: HeapNodeReadWrite<Pst>,
     <Pst as PstFile>::Store: StoreReadWrite<Pst>,
-    RowIndex: TableRowIndex<Pst>,
-    RowIndexTree: TableRowIndexTree<Pst, RowIndex = RowIndex>,
-    u32: From<RowIndex>,
 {
     fn read(
         store: Rc<<Pst as PstFile>::Store>,
@@ -907,88 +980,174 @@ where
             &mut page_cache,
             encoding,
             data.search_key(),
+            store.pst().read_control(),
         )?;
         let header = HeapNode::header(&heap)?;
-        let mut block_cache: DataBlockCache<Pst> = Default::default();
 
         let mut cursor = Cursor::new(heap.find_entry(header.user_root())?);
         let context = TableContextInfo::read(&mut cursor)?;
 
-        let rows = if let Some(rows) = context.rows {
-            match rows.id_type() {
-                Ok(NodeIdType::HeapNode) => {
-                    let rows: u32 = rows.into();
-                    vec![heap.find_entry(HeapId::from(rows))?.to_vec()]
-                }
-                _ => {
-                    let sub_node = node
-                        .sub_node()
-                        .ok_or(LtpError::PropertySubNodeValueNotFound(rows.into()))?;
-                    let block =
-                        block_btree.find_entry(file, sub_node.search_key(), &mut page_cache)?;
-                    let sub_node_tree = SubNodeTree::<Pst>::read(file, &block)?;
-                    let block =
-                        sub_node_tree.find_entry(file, &block_btree, rows, &mut page_cache)?;
-                    let block =
-                        block_btree.find_entry(file, block.search_key(), &mut page_cache)?;
-                    let data_tree = match block_cache.remove(&block.block().block()) {
-                        Some(data_tree) => data_tree,
-                        None => DataTree::read(file, encoding, &block)?,
-                    };
-                    let result = data_tree
-                        .blocks(
-                            file,
-                            encoding,
-                            &block_btree,
-                            &mut page_cache,
-                            &mut block_cache,
-                        )
-                        .map(|blocks| {
-                            blocks
-                                .map(|block| block.data().to_vec())
-                                .collect::<Vec<_>>()
-                        });
-                    block_cache.insert(block.block().block(), data_tree);
-                    result?
-                }
+        let control = store.pst().read_control();
+        let rows = match context.rows {
+            Some(rows) if rows.id_type()? != NodeIdType::HeapNode => {
+                let sub_node = node
+                    .sub_node()
+                    .ok_or(LtpError::PropertySubNodeValueNotFound(rows.into()))?;
+                let block = block_btree.find_entry(
+                    file,
+                    sub_node.search_key(),
+                    &mut page_cache,
+                    control,
+                )?;
+                let tree = SubNodeTree::<Pst>::read(file, &block, control)?;
+                let block = tree.find_entry(file, &block_btree, rows, &mut page_cache, control)?;
+                let block =
+                    block_btree.find_entry(file, block.search_key(), &mut page_cache, control)?;
+                Some(DataTree::read(file, encoding, &block, control)?)
             }
-            .into_iter()
-            .map(|data| {
-                let row_count = data.len() / context.end_existence_bitmap() as usize;
-                let mut cursor = Cursor::new(data);
-                let mut rows = Vec::with_capacity(row_count);
-                for _ in 0..row_count {
-                    let row = TableRowData::read(&mut cursor, &context)?;
-                    rows.push(row);
-                }
-                Ok(rows)
-            })
-            .collect::<io::Result<Vec<_>>>()?
-            .into_iter()
-            .flatten()
-            .collect()
-        } else {
-            Default::default()
+            _ => None,
         };
-
-        let row_index_tree = RowIndexTree::new(heap, context.row_index);
-        let row_index = row_index_tree
-            .entries()?
-            .into_iter()
-            .map(|entry| (entry.key(), entry.data()))
-            .collect();
-        let heap = row_index_tree.into();
 
         Ok(Self {
             store: store.clone(),
             node,
             context,
             heap,
-            row_index,
             rows,
-            block_cache: RefCell::new(block_cache),
-            _phantom: PhantomData,
         })
+    }
+
+    fn rows_matrix(&self) -> Box<dyn '_ + Iterator<Item = io::Result<TableRowData>>> {
+        Box::new(table_rows(
+            &self.context,
+            self.store.pst().read_control(),
+            self.row_blocks(),
+        ))
+    }
+
+    /// Returns a source of row-matrix blocks that reads data-tree leaves on demand.
+    fn row_blocks<'a>(&'a self) -> impl 'a + FnMut() -> io::Result<Option<TableRowBlock<'a, Pst>>> {
+        let pst = self.store.pst();
+        let mut cursor = None;
+        let mut heap_read = false;
+        move || match &self.rows {
+            Some(tree) => {
+                let cursor = match &mut cursor {
+                    Some(cursor) => cursor,
+                    None => cursor.insert(tree.block_cursor(pst.read_control())?),
+                };
+                let mut file = pst
+                    .reader()
+                    .lock()
+                    .map_err(|_| LtpError::FailedToLockFile)?;
+                let block = cursor.next_block(
+                    &mut *file,
+                    pst.header().crypt_method(),
+                    self.store.block_btree(),
+                    &mut pst.block_cache(),
+                )?;
+                Ok(block.map(TableRowBlock::Data))
+            }
+            None if heap_read => Ok(None),
+            None => {
+                heap_read = true;
+                self.context
+                    .rows
+                    .map(|rows| {
+                        self.heap
+                            .find_entry(HeapId::from(u32::from(rows)))
+                            .map(TableRowBlock::Heap)
+                    })
+                    .transpose()
+            }
+        }
+    }
+
+    fn find_row(&self, id: TableRowId) -> io::Result<TableRowData> {
+        let not_found = || LtpError::TableRowIdNotFound(u32::from(id)).into();
+        let index = self.row_index(id)?.ok_or_else(not_found)?;
+        match self.row_at(index)? {
+            Some(row) if row.id == id => Ok(row),
+            _ => Err(not_found()),
+        }
+    }
+
+    /// Looks up a row's position in the row index, a BTH keyed by row ID.
+    fn row_index(&self, id: TableRowId) -> io::Result<Option<usize>> {
+        let control = self.store.pst().read_control();
+        let mut cursor = Cursor::new(self.heap.find_entry(self.context.row_index)?);
+        let header = HeapTreeHeader::read(&mut cursor)?;
+        if header.key_size() != 4 {
+            return Err(LtpError::InvalidHeapTreeKeySize(header.key_size()).into());
+        }
+        // Row positions are 16-bit in ANSI files and 32-bit in Unicode files.
+        let index_size = mem::size_of::<<Pst as PstFile>::BTreeKey>() / 2;
+        if usize::from(header.entry_size()) != index_size {
+            return Err(LtpError::InvalidHeapTreeDataSize(header.entry_size()).into());
+        }
+        control.check_depth(usize::from(header.levels()))?;
+        let mut heap_id = header.root();
+        for level in (0..=header.levels()).rev() {
+            control.charge(1)?;
+            if u32::from(heap_id) == 0 {
+                return Ok(None);
+            }
+            let data = self.heap.find_entry(heap_id)?;
+            let size = 4 + if level == 0 { index_size } else { 4 };
+            if data.len() % size != 0 {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+            let count = data.len() / size;
+            control.charge(count)?;
+            let mut cursor = Cursor::new(data);
+            if level == 0 {
+                for _ in 0..count {
+                    let key = TableRowId::read(&mut cursor)?;
+                    let index = if index_size == 2 {
+                        u32::from(cursor.read_u16::<LittleEndian>()?)
+                    } else {
+                        cursor.read_u32::<LittleEndian>()?
+                    };
+                    if key == id {
+                        return Ok(Some(index as usize));
+                    }
+                }
+                return Ok(None);
+            }
+            let mut child = None;
+            for _ in 0..count {
+                let key = TableRowId::read(&mut cursor)?;
+                let next = HeapId::read(&mut cursor)?;
+                if key <= id {
+                    child = Some(next);
+                }
+            }
+            let Some(next) = child else {
+                return Ok(None);
+            };
+            heap_id = next;
+        }
+        Ok(None)
+    }
+
+    /// Reads the row at `index`, skipping whole blocks rather than decoding earlier rows.
+    fn row_at(&self, index: usize) -> io::Result<Option<TableRowData>> {
+        let control = self.store.pst().read_control();
+        let width = row_width(&self.context)?;
+        let mut next_block = self.row_blocks();
+        let mut remaining = index;
+        while let Some(block) = next_block()? {
+            control.charge(1)?;
+            let data = block.data();
+            let rows = data.len() / width;
+            if remaining < rows {
+                let start = remaining * width;
+                let row = &data[start..start + width];
+                return TableRowData::read(&mut Cursor::new(row), &self.context).map(Some);
+            }
+            remaining -= rows;
+        }
+        Ok(None)
     }
 
     fn read_column(
@@ -996,12 +1155,17 @@ where
         value: &TableRowColumnValue,
         prop_type: PropertyType,
     ) -> io::Result<PropertyValue> {
+        let control = self.store.pst().read_control();
+        control.charge(1)?;
         match value {
             TableRowColumnValue::Small(small) => Ok(small.clone()),
+            TableRowColumnValue::Heap(heap_id) if u32::from(*heap_id) == 0 => {
+                Ok(PropertyValue::Null)
+            }
             TableRowColumnValue::Heap(heap_id) => {
                 let data = self.heap.find_entry(*heap_id)?;
                 let mut cursor = Cursor::new(data);
-                PropertyValueReadWrite::read(&mut cursor, prop_type)
+                PropertyValue::read_with_control(&mut cursor, prop_type, control)
             }
             TableRowColumnValue::Node(sub_node_id) => {
                 let mut file = self
@@ -1022,40 +1186,33 @@ where
                         .ok_or(LtpError::PropertySubNodeValueNotFound(
                             (*sub_node_id).into(),
                         ))?;
-                let block = block_btree.find_entry(file, sub_node.search_key(), &mut page_cache)?;
-                let sub_node_tree = SubNodeTree::<Pst>::read(file, &block)?;
+                let block = block_btree.find_entry(
+                    file,
+                    sub_node.search_key(),
+                    &mut page_cache,
+                    control,
+                )?;
+                let sub_node_tree = SubNodeTree::<Pst>::read(file, &block, control)?;
+                let block = sub_node_tree.find_entry(
+                    file,
+                    block_btree,
+                    *sub_node_id,
+                    &mut page_cache,
+                    control,
+                )?;
                 let block =
-                    sub_node_tree.find_entry(file, block_btree, *sub_node_id, &mut page_cache)?;
-                let block = block_btree.find_entry(file, block.search_key(), &mut page_cache)?;
-                let mut block_cache = self.block_cache.borrow_mut();
-                let data_tree = match block_cache.remove(&block.block().block()) {
-                    Some(data_tree) => data_tree,
-                    None => DataTree::read(file, encoding, &block)?,
-                };
-                let result = data_tree
-                    .reader(
-                        file,
-                        encoding,
-                        block_btree,
-                        &mut page_cache,
-                        &mut block_cache,
-                    )
-                    .and_then(|mut r| PropertyValueReadWrite::read(&mut r, prop_type));
-                block_cache.insert(block.block().block(), data_tree);
-                result
+                    block_btree.find_entry(file, block.search_key(), &mut page_cache, control)?;
+                let data_tree = DataTree::<Pst>::read(file, encoding, &block, control)?;
+                let mut reader =
+                    data_tree.reader(file, encoding, block_btree, &mut page_cache, control)?;
+                PropertyValue::read_with_control(&mut reader, prop_type, control)
             }
         }
     }
 }
 
-type UnicodeRowIndexTree = UnicodeHeapTree<TableRowId, UnicodeTableRowIndex>;
-
-impl TableRowIndexTree<UnicodePstFile> for UnicodeRowIndexTree {
-    type RowIndex = UnicodeTableRowIndex;
-}
-
 pub struct UnicodeTableContext {
-    inner: TableContextInner<UnicodePstFile, UnicodeTableRowIndex, UnicodeRowIndexTree>,
+    inner: TableContextInner<UnicodePstFile>,
 }
 
 impl UnicodeTableContext {
@@ -1072,17 +1229,12 @@ impl TableContext for UnicodeTableContext {
         &self.inner.context
     }
 
-    fn rows_matrix<'a>(&'a self) -> Box<dyn 'a + Iterator<Item = &'a TableRowData>> {
-        Box::new(self.inner.rows.iter())
+    fn rows_matrix<'a>(&'a self) -> Box<dyn 'a + Iterator<Item = io::Result<TableRowData>>> {
+        self.inner.rows_matrix()
     }
 
-    fn find_row(&self, id: TableRowId) -> LtpResult<&TableRowData> {
-        let index = self
-            .inner
-            .row_index
-            .get(&id)
-            .ok_or(LtpError::TableRowIdNotFound(u32::from(id)))?;
-        Ok(&self.inner.rows[u32::from(*index) as usize])
+    fn find_row(&self, id: TableRowId) -> io::Result<TableRowData> {
+        self.inner.find_row(id)
     }
 
     fn read_column(
@@ -1104,14 +1256,8 @@ impl TableContextReadWrite<UnicodePstFile> for UnicodeTableContext {
     }
 }
 
-type AnsiRowIndexTree = AnsiHeapTree<TableRowId, AnsiTableRowIndex>;
-
-impl TableRowIndexTree<AnsiPstFile> for AnsiRowIndexTree {
-    type RowIndex = AnsiTableRowIndex;
-}
-
 pub struct AnsiTableContext {
-    inner: TableContextInner<AnsiPstFile, AnsiTableRowIndex, AnsiRowIndexTree>,
+    inner: TableContextInner<AnsiPstFile>,
 }
 
 impl AnsiTableContext {
@@ -1128,17 +1274,12 @@ impl TableContext for AnsiTableContext {
         &self.inner.context
     }
 
-    fn rows_matrix<'a>(&'a self) -> Box<dyn 'a + Iterator<Item = &'a TableRowData>> {
-        Box::new(self.inner.rows.iter())
+    fn rows_matrix<'a>(&'a self) -> Box<dyn 'a + Iterator<Item = io::Result<TableRowData>>> {
+        self.inner.rows_matrix()
     }
 
-    fn find_row(&self, id: TableRowId) -> LtpResult<&TableRowData> {
-        let index = self
-            .inner
-            .row_index
-            .get(&id)
-            .ok_or(LtpError::TableRowIdNotFound(u32::from(id)))?;
-        Ok(&self.inner.rows[u32::from(*index) as usize])
+    fn find_row(&self, id: TableRowId) -> io::Result<TableRowData> {
+        self.inner.find_row(id)
     }
 
     fn read_column(
@@ -1154,5 +1295,86 @@ impl TableContextReadWrite<AnsiPstFile> for AnsiTableContext {
     fn read(store: Rc<AnsiStore>, node: AnsiNodeBTreeEntry) -> io::Result<Rc<dyn TableContext>> {
         let inner = TableContextInner::read(store, node)?;
         Ok(Rc::new(Self { inner }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn context() -> TableContextInfo {
+        TableContextInfo::new(8, 8, 8, 8, HeapId::default(), None, Vec::new()).unwrap()
+    }
+
+    #[test]
+    fn zero_width_table_rows_are_rejected() {
+        assert!(TableContextInfo::new(0, 0, 0, 0, HeapId::default(), None, Vec::new(),).is_err());
+    }
+
+    #[test]
+    fn column_offset_overflow_is_rejected() {
+        let column = TableColumnDescriptor::new(PropertyType::Integer32, 0x1234, 65532, 4, 0);
+        assert!(TableContextInfo::new(8, 8, 8, 9, HeapId::default(), None, vec![column],).is_err());
+    }
+
+    #[test]
+    fn table_rows_read_one_block_at_a_time_and_keep_owned_rows() {
+        let context = context();
+        let control = ReadControl::default();
+        let reads = Cell::new(0);
+        let first = [1, 0, 0, 0, 10, 0, 0, 0, 0xff];
+        let second = [2, 0, 0, 0, 20, 0, 0, 0];
+        let mut blocks = [&first[..], &second[..]].into_iter();
+        let mut rows = table_rows::<UnicodePstFile, _>(&context, &control, || {
+            reads.set(reads.get() + 1);
+            Ok(blocks.next().map(TableRowBlock::Heap))
+        });
+        assert_eq!(reads.get(), 0);
+        let first_row = rows.next().unwrap().unwrap();
+        assert_eq!(reads.get(), 1);
+        let second_row = rows.next().unwrap().unwrap();
+        assert_eq!(reads.get(), 2);
+        assert_eq!(u32::from(first_row.id), 1);
+        assert_eq!(u32::from(second_row.id), 2);
+        assert!(rows.next().is_none());
+        assert_eq!(reads.get(), 3);
+        assert!(rows.next().is_none());
+        assert_eq!(reads.get(), 3);
+    }
+
+    #[test]
+    fn table_row_errors_are_reported_once() {
+        let context = context();
+        let control = ReadControl::default();
+        let reads = Cell::new(0);
+        let mut rows = table_rows::<UnicodePstFile, _>(&context, &control, || {
+            reads.set(reads.get() + 1);
+            Err(io::ErrorKind::PermissionDenied.into())
+        });
+        assert_eq!(
+            rows.next().unwrap().err().unwrap().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert!(rows.next().is_none());
+        assert_eq!(reads.get(), 1);
+    }
+
+    #[test]
+    fn cancellation_stops_rows_already_buffered() {
+        let context = context();
+        let control = ReadControl::default();
+        let data = [0; 16];
+        let mut blocks = Some(&data[..]);
+        let mut rows = table_rows::<UnicodePstFile, _>(&context, &control, || {
+            Ok(blocks.take().map(TableRowBlock::Heap))
+        });
+        assert!(rows.next().unwrap().is_ok());
+        control.cancel();
+        assert_eq!(
+            rows.next().unwrap().err().unwrap().kind(),
+            io::ErrorKind::Other
+        );
+        assert!(rows.next().is_none());
     }
 }

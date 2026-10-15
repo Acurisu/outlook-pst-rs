@@ -258,6 +258,7 @@ impl StoreProperties {
 
 pub trait Store {
     fn properties(&self) -> &StoreProperties;
+    fn read_control(&self) -> &ReadControl;
     fn root_hierarchy_table(&self) -> io::Result<Rc<dyn TableContext>>;
     fn unique_value(&self) -> u32;
     fn open_folder(&self, entry_id: &EntryId) -> io::Result<Rc<dyn Folder>>;
@@ -341,7 +342,8 @@ where
 
             let mut page_cache = pst.node_cache();
             let node_key: <Pst as PstFile>::BTreeKey = u32::from(NID_MESSAGE_STORE).into();
-            let node = node_btree.find_entry(file, node_key, &mut page_cache)?;
+            let node =
+                node_btree.find_entry(file, node_key, &mut page_cache, pst.read_control())?;
 
             let mut page_cache = pst.block_cache();
             let data = node.data();
@@ -351,20 +353,23 @@ where
                 &mut page_cache,
                 encoding,
                 data.search_key(),
+                pst.read_control(),
             )?;
             let header = heap.header()?;
 
             let tree = <Pst as PstFile>::PropertyTree::new(heap, header.user_root());
             let prop_context = <Pst as PstFile>::PropertyContext::new(node, tree);
-            let properties = prop_context
-                .properties()?
-                .into_iter()
-                .map(|(prop_id, record)| {
-                    prop_context
-                        .read_property(file, encoding, &block_btree, &mut page_cache, record)
-                        .map(|value| (prop_id, value))
-                })
-                .collect::<io::Result<BTreeMap<_, _>>>()?;
+            let properties = collect_properties(
+                prop_context
+                    .properties()?
+                    .into_iter()
+                    .map(|(prop_id, record)| {
+                        prop_context
+                            .read_property(file, encoding, &block_btree, &mut page_cache, record)
+                            .map(|value| (prop_id, value))
+                    }),
+                pst.read_control(),
+            )?;
             let properties = StoreProperties { properties };
 
             (node_btree, block_btree, properties)
@@ -401,8 +406,12 @@ where
                     let node_id = NodeId::new(NodeIdType::HierarchyTable, NID_ROOT_FOLDER.index())?;
                     let mut page_cache = self.pst.node_cache();
                     let node_key: <Pst as PstFile>::BTreeKey = u32::from(node_id).into();
-                    self.node_btree
-                        .find_entry(file, node_key, &mut page_cache)?
+                    self.node_btree.find_entry(
+                        file,
+                        node_key,
+                        &mut page_cache,
+                        self.pst.read_control(),
+                    )?
                 };
 
                 <<Pst as PstFile>::TableContext as TableContextReadWrite<Pst>>::read(
@@ -486,6 +495,10 @@ impl UnicodeStore {
 }
 
 impl Store for UnicodeStore {
+    fn read_control(&self) -> &ReadControl {
+        self.inner.pst.read_control()
+    }
+
     fn properties(&self) -> &StoreProperties {
         &self.inner.properties
     }
@@ -554,6 +567,10 @@ impl AnsiStore {
 }
 
 impl Store for AnsiStore {
+    fn read_control(&self) -> &ReadControl {
+        self.inner.pst.read_control()
+    }
+
     fn properties(&self) -> &StoreProperties {
         &self.inner.properties
     }

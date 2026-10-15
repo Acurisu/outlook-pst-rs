@@ -20,6 +20,9 @@ pub mod ndb;
 mod block_sig;
 mod crc;
 mod encode;
+mod read_control;
+
+pub use read_control::{ReadControl, ReadLimits};
 
 use ltp::{heap::*, prop_context::*, table_context::*, tree::*};
 use messaging::{folder::*, message::*, named_prop::*, search::*, store::*};
@@ -200,6 +203,7 @@ pub trait PstFile: Sized {
     fn header(&self) -> &Self::Header;
     fn density_list(&self) -> Result<&dyn DensityListPage<Self>, &io::Error>;
     fn reader(&self) -> &Mutex<Box<dyn PstReader>>;
+    fn read_control(&self) -> &ReadControl;
     fn lock(&mut self) -> io::Result<PstFileLockGuard<'_, Self>>;
 
     fn read_node(&self, node: NodeId) -> io::Result<Self::NodeBTreeEntry>;
@@ -211,6 +215,7 @@ where
     Pst: PstFile,
 {
     reader: Mutex<Box<dyn PstReader>>,
+    read_control: ReadControl,
     writer: PstResult<Mutex<BufWriter<File>>>,
     header: Pst::Header,
     density_list: io::Result<Pst::DensityListPage>,
@@ -224,12 +229,23 @@ pub struct UnicodePstFile {
 
 impl UnicodePstFile {
     pub fn read_from(reader: Box<dyn PstReader>) -> io::Result<Self> {
-        let inner = PstFileInner::read_from(reader)?;
+        Self::read_from_with_control(reader, ReadControl::default())
+    }
+
+    pub fn read_from_with_control(
+        reader: Box<dyn PstReader>,
+        control: ReadControl,
+    ) -> io::Result<Self> {
+        let inner = PstFileInner::read_from(reader, control)?;
         Ok(Self { inner })
     }
 
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
-        let inner = PstFileInner::open(path)?;
+        Self::open_with_control(path, ReadControl::default())
+    }
+
+    pub fn open_with_control(path: impl AsRef<Path>, control: ReadControl) -> io::Result<Self> {
+        let inner = PstFileInner::open(path, control)?;
         Ok(Self { inner })
     }
 }
@@ -300,6 +316,10 @@ impl PstFile for UnicodePstFile {
         &self.inner.reader
     }
 
+    fn read_control(&self) -> &ReadControl {
+        &self.inner.read_control
+    }
+
     fn lock(&mut self) -> io::Result<PstFileLockGuard<'_, Self>> {
         PstFileLockGuard::new(self)
     }
@@ -319,12 +339,23 @@ pub struct AnsiPstFile {
 
 impl AnsiPstFile {
     pub fn read_from(reader: Box<dyn PstReader>) -> io::Result<Self> {
-        let inner = PstFileInner::read_from(reader)?;
+        Self::read_from_with_control(reader, ReadControl::default())
+    }
+
+    pub fn read_from_with_control(
+        reader: Box<dyn PstReader>,
+        control: ReadControl,
+    ) -> io::Result<Self> {
+        let inner = PstFileInner::read_from(reader, control)?;
         Ok(Self { inner })
     }
 
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
-        let inner = PstFileInner::open(path)?;
+        Self::open_with_control(path, ReadControl::default())
+    }
+
+    pub fn open_with_control(path: impl AsRef<Path>, control: ReadControl) -> io::Result<Self> {
+        let inner = PstFileInner::open(path, control)?;
         Ok(Self { inner })
     }
 }
@@ -393,6 +424,10 @@ impl PstFile for AnsiPstFile {
 
     fn reader(&self) -> &Mutex<Box<dyn PstReader>> {
         &self.inner.reader
+    }
+
+    fn read_control(&self) -> &ReadControl {
+        &self.inner.read_control
     }
 
     fn lock(&mut self) -> io::Result<PstFileLockGuard<'_, Self>> {
@@ -512,11 +547,13 @@ where
     <<Pst as PstFile>::SubNodeBlock as IntermediateTreeBlock>::Entry:
         IntermediateTreeEntryReadWrite,
 {
-    fn read_from(mut reader: Box<dyn PstReader>) -> io::Result<Self> {
+    fn read_from(mut reader: Box<dyn PstReader>, read_control: ReadControl) -> io::Result<Self> {
+        read_control.charge(1)?;
         let header = <<Pst as PstFile>::Header as HeaderReadWrite<Pst>>::read(&mut reader)?;
         let density_list =
             <<Pst as PstFile>::DensityListPage as DensityListPageReadWrite<Pst>>::read(&mut reader);
         Ok(Self {
+            read_control,
             reader: Mutex::new(Box::new(reader)),
             writer: Err(PstError::OpenedReadOnly),
             header,
@@ -526,7 +563,7 @@ where
         })
     }
 
-    fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+    fn open(path: impl AsRef<Path>, control: ReadControl) -> io::Result<Self> {
         let reader = Box::new(File::open(&path)?);
         let writer = OpenOptions::new()
             .write(true)
@@ -536,7 +573,7 @@ where
             .map_err(|_| PstError::NoWriteAccess(path.as_ref().display().to_string()));
         Ok(Self {
             writer,
-            ..Self::read_from(reader)?
+            ..Self::read_from(reader, control)?
         })
     }
 
@@ -1144,6 +1181,7 @@ where
     }
 
     fn read_node(&self, node: NodeId) -> io::Result<<Pst as PstFile>::NodeBTreeEntry> {
+        self.read_control.charge(1)?;
         let node_btree = *self.header.root().node_btree();
         let mut reader = self.reader.lock().map_err(|_| PstError::LockError)?;
         let reader = &mut *reader;
@@ -1151,11 +1189,12 @@ where
             <<Pst as PstFile>::NodeBTree as RootBTreeReadWrite>::read(reader, node_btree)?;
         let mut page_cache = self.node_cache.borrow_mut();
         let node_id: <Pst as PstFile>::BTreeKey = u32::from(node).into();
-        let node = node_btree.find_entry(reader, node_id, &mut page_cache)?;
+        let node = node_btree.find_entry(reader, node_id, &mut page_cache, &self.read_control)?;
         Ok(node)
     }
 
     fn read_block(&self, block: <Pst as PstFile>::BlockId) -> io::Result<Vec<u8>> {
+        self.read_control.charge(1)?;
         let encoding = self.header.crypt_method();
         let block_btree = *self.header.root().block_btree();
         let mut reader = self.reader.lock().map_err(|_| PstError::LockError)?;
@@ -1163,28 +1202,82 @@ where
         let block_btree =
             <<Pst as PstFile>::BlockBTree as RootBTreeReadWrite>::read(reader, block_btree)?;
         let mut page_cache = self.block_cache.borrow_mut();
-        let block = block_btree.find_entry(reader, block.search_key(), &mut page_cache)?;
-        let block = DataTree::<Pst>::read(reader, encoding, &block)?;
-        let mut block_cache = Default::default();
-        let mut data = vec![];
-        let _ = block
-            .reader(
-                reader,
-                encoding,
-                &block_btree,
-                &mut page_cache,
-                &mut block_cache,
-            )?
-            .read_to_end(&mut data)?;
-        Ok(data)
+        let block = block_btree.find_entry(
+            reader,
+            block.search_key(),
+            &mut page_cache,
+            &self.read_control,
+        )?;
+        let block = DataTree::<Pst>::read(reader, encoding, &block, &self.read_control)?;
+        let mut input = block.reader(
+            reader,
+            encoding,
+            &block_btree,
+            &mut page_cache,
+            &self.read_control,
+        )?;
+        self.read_control.read_to_vec(&mut input)
     }
 }
 
 pub fn open_store(path: impl AsRef<Path>) -> io::Result<Rc<dyn Store>> {
-    Ok(if let Ok(pst_file) = UnicodePstFile::open(path.as_ref()) {
-        UnicodeStore::read(Rc::new(pst_file))?
-    } else {
-        let pst_file = AnsiPstFile::open(path.as_ref())?;
-        AnsiStore::read(Rc::new(pst_file))?
-    })
+    open_store_with_control(path, ReadControl::default())
+}
+
+pub fn open_store_with_control(
+    path: impl AsRef<Path>,
+    control: ReadControl,
+) -> io::Result<Rc<dyn Store>> {
+    control.check()?;
+    match UnicodePstFile::open_with_control(path.as_ref(), control.clone()) {
+        Ok(pst_file) => Ok(UnicodeStore::read(Rc::new(pst_file))?),
+        Err(error) if matches!(NdbError::from_io(&error), Some(NdbError::AnsiPstVersion(_))) => {
+            let pst_file = AnsiPstFile::open_with_control(path.as_ref(), control)?;
+            Ok(AnsiStore::read(Rc::new(pst_file))?)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{cell::Cell, io::Cursor};
+
+    struct CountReads {
+        reads: Rc<Cell<usize>>,
+        input: Cursor<Vec<u8>>,
+    }
+
+    impl Read for CountReads {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            self.reads.set(self.reads.get() + 1);
+            self.input.read(output)
+        }
+    }
+
+    impl Seek for CountReads {
+        fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+            self.input.seek(position)
+        }
+    }
+
+    #[test]
+    fn cancelled_and_exhausted_controls_stop_store_opening_before_io() {
+        let cancelled = ReadControl::default();
+        cancelled.cancel();
+        let exhausted = ReadControl::new(ReadLimits {
+            max_work: 0,
+            ..ReadLimits::default()
+        });
+        for control in [cancelled, exhausted] {
+            let reads = Rc::new(Cell::new(0));
+            let reader = Box::new(CountReads {
+                reads: reads.clone(),
+                input: Cursor::new(Vec::new()),
+            });
+            assert!(UnicodePstFile::read_from_with_control(reader, control).is_err());
+            assert_eq!(reads.get(), 0);
+        }
+    }
 }

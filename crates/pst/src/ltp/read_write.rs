@@ -26,6 +26,7 @@ where
         page_cache: &mut RootBTreePageCache<<Pst as PstFile>::BlockBTree>,
         encoding: NdbCryptMethod,
         key: <Pst as PstFile>::BTreeKey,
+        control: &ReadControl,
     ) -> io::Result<Self>;
 }
 
@@ -61,6 +62,15 @@ where
         page_cache: &mut RootBTreePageCache<<Pst as PstFile>::BlockBTree>,
         value: PropertyTreeRecordValue,
     ) -> io::Result<PropertyValue>;
+    fn copy_binary_property<R: PstReader>(
+        &self,
+        f: &mut R,
+        encoding: NdbCryptMethod,
+        block_btree: &PstFileReadWriteBlockBTree<Pst>,
+        page_cache: &mut RootBTreePageCache<<Pst as PstFile>::BlockBTree>,
+        value: PropertyTreeRecordValue,
+        writer: &mut dyn Write,
+    ) -> io::Result<u64>;
 }
 
 pub trait TableContextInfoReadWrite: Sized {

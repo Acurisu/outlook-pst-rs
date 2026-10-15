@@ -41,6 +41,7 @@ fn main() -> anyhow::Result<()> {
             None,
             &block_btree,
             *root.node_btree(),
+            pst.read_control(),
         )?;
     }
 
@@ -54,10 +55,12 @@ fn output_data_tree<R: PstReader>(
     max_level: Option<u8>,
     block_btree: &UnicodeBlockBTree,
     node_data_tree: UnicodeBlockId,
+    control: &ReadControl,
 ) -> io::Result<()> {
     let mut page_cache = Default::default();
-    let data_block = block_btree.find_entry(file, node_data_tree.search_key(), &mut page_cache)?;
-    let data_tree = UnicodeDataTree::read(&mut *file, encoding, &data_block)?;
+    let data_block =
+        block_btree.find_entry(file, node_data_tree.search_key(), &mut page_cache, control)?;
+    let data_tree = UnicodeDataTree::read(&mut *file, encoding, &data_block, control)?;
     match data_tree {
         UnicodeDataTree::Intermediate(block) => {
             let level = block.header().level();
@@ -89,6 +92,7 @@ fn output_data_tree<R: PstReader>(
                     max_level,
                     block_btree,
                     entry.block(),
+                    control,
                 )?;
             }
         }
@@ -114,11 +118,12 @@ fn output_sub_node_tree<R: PstReader>(
     max_level: Option<u8>,
     block_btree: &UnicodeBlockBTree,
     sub_node_btree: UnicodeBlockId,
+    control: &ReadControl,
 ) -> io::Result<()> {
     let mut page_cache = Default::default();
     let sub_node_block =
-        block_btree.find_entry(file, sub_node_btree.search_key(), &mut page_cache)?;
-    let sub_node_btree = UnicodeSubNodeTree::read(&mut *file, &sub_node_block)?;
+        block_btree.find_entry(file, sub_node_btree.search_key(), &mut page_cache, control)?;
+    let sub_node_btree = UnicodeSubNodeTree::read(&mut *file, &sub_node_block, control)?;
     match sub_node_btree {
         UnicodeSubNodeTree::Intermediate(block) => {
             let level = block.header().level();
@@ -146,6 +151,7 @@ fn output_sub_node_tree<R: PstReader>(
                     max_level,
                     block_btree,
                     entry.block(),
+                    control,
                 )?;
             }
         }
@@ -173,10 +179,15 @@ fn output_sub_node_tree<R: PstReader>(
                     None,
                     block_btree,
                     entry.block(),
+                    control,
                 )?;
 
-                let sub_node_block =
-                    block_btree.find_entry(file, entry.block().search_key(), &mut page_cache)?;
+                let sub_node_block = block_btree.find_entry(
+                    file,
+                    entry.block().search_key(),
+                    &mut page_cache,
+                    control,
+                )?;
                 println!(
                     "{indent}{sub_node_indent}  PageRef: {:?}",
                     sub_node_block.block()
@@ -185,7 +196,15 @@ fn output_sub_node_tree<R: PstReader>(
                 if let Some(sub_node) = entry.sub_node() {
                     let indent = format!("{indent}{sub_node_indent}  ");
                     println!("{indent}Sub-Node Block: {sub_node:?}");
-                    output_sub_node_tree(file, encoding, &indent, None, block_btree, sub_node)?;
+                    output_sub_node_tree(
+                        file,
+                        encoding,
+                        &indent,
+                        None,
+                        block_btree,
+                        sub_node,
+                        control,
+                    )?;
                 } else {
                     println!("{indent}{sub_node_indent}  Sub-Node Block: None");
                 }
@@ -201,6 +220,7 @@ fn output_node_btree<R: PstReader>(
     max_level: Option<u8>,
     block_btree: &UnicodeBlockBTree,
     node_btree: UnicodePageRef,
+    control: &ReadControl,
 ) -> io::Result<()> {
     let node_btree = UnicodeNodeBTree::read(&mut *file, node_btree)?;
     match node_btree {
@@ -226,7 +246,14 @@ fn output_node_btree<R: PstReader>(
                     continue;
                 };
                 println!("{indent} Key: {key:?}");
-                output_node_btree(file, encoding, max_level, block_btree, entry.block())?;
+                output_node_btree(
+                    file,
+                    encoding,
+                    max_level,
+                    block_btree,
+                    entry.block(),
+                    control,
+                )?;
             }
         }
         UnicodeNodeBTree::Leaf(page) => {
@@ -245,13 +272,29 @@ fn output_node_btree<R: PstReader>(
                 if entry.data().search_key() == 0 {
                     println!("{indent}Data Block: {:?}", entry.data());
                 } else {
-                    output_data_tree(file, encoding, &indent, None, block_btree, entry.data())?;
+                    output_data_tree(
+                        file,
+                        encoding,
+                        &indent,
+                        None,
+                        block_btree,
+                        entry.data(),
+                        control,
+                    )?;
                 }
 
                 if let Some(sub_node) = entry.sub_node() {
                     println!("{indent}Sub-Node Block: {sub_node:?}");
                     let indent = format!("{indent} ");
-                    output_sub_node_tree(file, encoding, &indent, None, block_btree, sub_node)?;
+                    output_sub_node_tree(
+                        file,
+                        encoding,
+                        &indent,
+                        None,
+                        block_btree,
+                        sub_node,
+                        control,
+                    )?;
                 } else {
                     println!("{indent}Sub-Node Block: None");
                 }

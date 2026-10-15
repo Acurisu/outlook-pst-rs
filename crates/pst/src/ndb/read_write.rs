@@ -14,7 +14,7 @@ use super::{
 use crate::{
     crc::compute_crc,
     encode::{cyclic, permute},
-    PstFile, PstReader,
+    PstFile, PstReader, ReadControl,
 };
 
 pub trait NodeIdReadWrite: Copy + Sized {
@@ -568,10 +568,14 @@ where
     fn new(encoding: NdbCryptMethod, data: Vec<u8>, trailer: Self::Trailer) -> NdbResult<Self>;
 
     fn read<R: PstReader>(f: &mut R, size: u16, encoding: NdbCryptMethod) -> io::Result<Self> {
+        let total = size
+            .checked_add(Self::Trailer::SIZE)
+            .filter(|total| *total <= MAX_BLOCK_SIZE)
+            .ok_or(NdbError::InvalidBlockSize(size))?;
         let mut data = vec![0; size as usize];
         f.read_exact(&mut data)?;
 
-        let offset = size + Self::Trailer::SIZE;
+        let offset = total;
         let offset = i64::from(block_size(offset) - offset);
         if offset > 0 {
             f.seek(SeekFrom::Current(offset))?;
@@ -668,23 +672,28 @@ where
     ) -> NdbResult<Self>;
 
     fn read<R: PstReader>(f: &mut R, header: Self::Header, size: u16) -> io::Result<Self> {
+        let total = size
+            .checked_add(Self::Trailer::SIZE)
+            .filter(|total| *total <= MAX_BLOCK_SIZE)
+            .ok_or(NdbError::InvalidBlockSize(size))?;
+        let entry_count = header.entry_count();
+        entry_count
+            .checked_mul(Self::Entry::ENTRY_SIZE)
+            .and_then(|bytes| bytes.checked_add(Self::Header::HEADER_SIZE))
+            .filter(|bytes| *bytes <= size)
+            .ok_or(NdbError::InvalidInternalBlockEntryCount(entry_count))?;
         let mut data = vec![0; size as usize];
         f.read_exact(&mut data)?;
+        // The entries were checked to fit between the header and the end of the block.
         let mut cursor = Cursor::new(&data[Self::Header::HEADER_SIZE as usize..]);
-
-        let entry_count = header.entry_count();
-
-        if entry_count * Self::Entry::ENTRY_SIZE > size - Self::Header::HEADER_SIZE {
-            return Err(NdbError::InvalidInternalBlockEntryCount(entry_count).into());
+        // Collecting through `Result` would lose the exact size hint and over-allocate.
+        let mut entries = Vec::with_capacity(usize::from(entry_count));
+        for _ in 0..entry_count {
+            entries.push(<Self::Entry as IntermediateTreeEntryReadWrite>::read(
+                &mut cursor,
+            )?);
         }
-
-        let entries = (0..entry_count)
-            .map(move |_| <Self::Entry as IntermediateTreeEntryReadWrite>::read(&mut cursor))
-            .collect::<io::Result<Vec<_>>>()?;
-
-        let size = Self::Header::HEADER_SIZE + entry_count * Self::Entry::ENTRY_SIZE;
-        let offset = size + Self::Trailer::SIZE;
-        let offset = i64::from(block_size(offset) - offset);
+        let offset = i64::from(block_size(total) - total);
         match offset.cmp(&0) {
             Ordering::Greater => {
                 f.seek(SeekFrom::Current(offset))?;
@@ -779,6 +788,7 @@ where
         f: &mut R,
         key: <<Self as RootBTree>::Pst as PstFile>::BTreeKey,
         page_cache: &mut RootBTreePageCache<Self>,
+        control: &ReadControl,
     ) -> io::Result<<Self as RootBTree>::Entry>;
 }
 

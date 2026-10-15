@@ -1,7 +1,7 @@
 //! ## [HN (Heap-on-Node)](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/77ce49a3-3772-4d8d-bb2c-2f7520a238a6)
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{self, Cursor, Read, Write};
 
 use super::{read_write::*, *};
 use crate::{
@@ -13,7 +13,7 @@ use crate::{
         page::{AnsiBlockBTree, RootBTree, UnicodeBlockBTree},
         read_write::*,
     },
-    AnsiPstFile, PstFile, PstFileReadWriteBlockBTree, PstReader, UnicodePstFile,
+    AnsiPstFile, PstFile, PstFileReadWriteBlockBTree, PstReader, ReadControl, UnicodePstFile,
 };
 
 pub const HEAP_INDEX_MASK: u32 = (1_u16.rotate_right(5) - 1) as u32;
@@ -506,6 +506,7 @@ impl HeapNodePageReadWrite for HeapNodePageMap {
 pub trait HeapNode {
     fn header(&self) -> io::Result<HeapNodeHeader>;
     fn find_entry(&self, heap_id: HeapId) -> io::Result<&[u8]>;
+    fn read_control(&self) -> &ReadControl;
 }
 
 struct HeapNodeInner<Pst>
@@ -513,6 +514,7 @@ where
     Pst: PstFile,
 {
     data: Vec<<Pst as PstFile>::DataBlock>,
+    control: ReadControl,
 }
 
 impl<Pst> HeapNodeInner<Pst>
@@ -545,20 +547,17 @@ where
         page_cache: &mut RootBTreePageCache<<Pst as PstFile>::BlockBTree>,
         encoding: NdbCryptMethod,
         key: <Pst as PstFile>::BTreeKey,
+        control: &ReadControl,
     ) -> io::Result<Self> {
-        let block = block_btree.find_entry(f, key, page_cache)?;
-        let data_tree = DataTree::<Pst>::read(f, encoding, &block)?;
-        let data = data_tree
-            .blocks(
-                f,
-                encoding,
-                block_btree,
-                page_cache,
-                &mut Default::default(),
-            )?
-            .collect();
+        let block = block_btree.find_entry(f, key, page_cache, control)?;
+        let data = DataTree::<Pst>::read(f, encoding, &block, control)?
+            .block_cursor(control)?
+            .read_all(f, encoding, block_btree, page_cache)?;
 
-        Ok(Self { data })
+        Ok(Self {
+            data,
+            control: control.clone(),
+        })
     }
 
     fn header(&self) -> io::Result<HeapNodeHeader> {
@@ -573,6 +572,7 @@ where
         <Pst as PstFile>::DataBlock: 'a,
     {
         let block_index = heap_id.block_index();
+        self.control.charge(1)?;
         let block = self
             .data
             .get(block_index as usize)
@@ -596,8 +596,20 @@ where
             }
         };
 
-        cursor.seek(SeekFrom::Start(u64::from(page_map_offset)))?;
+        let header_end = cursor.position() as usize;
+        if usize::from(page_map_offset) < header_end {
+            return Err(LtpError::InvalidHeapPageAllocOffset(page_map_offset).into());
+        }
+        let mut cursor = Cursor::new(
+            block
+                .get(usize::from(page_map_offset)..)
+                .ok_or(io::ErrorKind::UnexpectedEof)?,
+        );
         let page_map = HeapNodePageMap::read(&mut cursor)?;
+        // Allocations must lie between the page header and the page map.
+        if page_map.next_offset() > page_map_offset {
+            return Err(LtpError::InvalidHeapPageAllocOffset(page_map.next_offset()).into());
+        }
         let allocations = page_map.allocations();
 
         let index = heap_id.index()?;
@@ -607,8 +619,13 @@ where
 
         let alloc = &allocations[index as usize];
         let start = alloc.offset() as usize;
+        if start < header_end {
+            return Err(LtpError::InvalidHeapPageAllocOffset(alloc.offset()).into());
+        }
         let end = start + alloc.size() as usize;
-        Ok(&block[start..end])
+        block
+            .get(start..end)
+            .ok_or_else(|| LtpError::InvalidHeapPageAllocOffset(alloc.offset()).into())
     }
 }
 
@@ -617,6 +634,10 @@ pub struct UnicodeHeapNode {
 }
 
 impl HeapNode for UnicodeHeapNode {
+    fn read_control(&self) -> &ReadControl {
+        &self.inner.control
+    }
+
     fn header(&self) -> io::Result<HeapNodeHeader> {
         self.inner.header()
     }
@@ -633,8 +654,9 @@ impl HeapNodeReadWrite<UnicodePstFile> for UnicodeHeapNode {
         page_cache: &mut RootBTreePageCache<UnicodeBlockBTree>,
         encoding: NdbCryptMethod,
         key: u64,
+        control: &ReadControl,
     ) -> io::Result<Self> {
-        let inner = HeapNodeInner::read(f, block_btree, page_cache, encoding, key)?;
+        let inner = HeapNodeInner::read(f, block_btree, page_cache, encoding, key, control)?;
         Ok(Self { inner })
     }
 }
@@ -644,6 +666,10 @@ pub struct AnsiHeapNode {
 }
 
 impl HeapNode for AnsiHeapNode {
+    fn read_control(&self) -> &ReadControl {
+        &self.inner.control
+    }
+
     fn header(&self) -> io::Result<HeapNodeHeader> {
         self.inner.header()
     }
@@ -660,8 +686,54 @@ impl HeapNodeReadWrite<AnsiPstFile> for AnsiHeapNode {
         page_cache: &mut RootBTreePageCache<AnsiBlockBTree>,
         encoding: NdbCryptMethod,
         key: u32,
+        control: &ReadControl,
     ) -> io::Result<Self> {
-        let inner = HeapNodeInner::read(f, block_btree, page_cache, encoding, key)?;
+        let inner = HeapNodeInner::read(f, block_btree, page_cache, encoding, key, control)?;
         Ok(Self { inner })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn heap_with_page(page: Vec<u8>) -> HeapNodeInner<UnicodePstFile> {
+        HeapNodeInner {
+            data: vec![
+                UnicodeDataBlock::default(),
+                UnicodeDataBlock::new(NdbCryptMethod::None, page, UnicodeBlockTrailer::default())
+                    .unwrap(),
+            ],
+            control: ReadControl::default(),
+        }
+    }
+
+    #[test]
+    fn heap_allocation_beyond_block_is_an_error_not_a_panic() {
+        let heap = heap_with_page(vec![4, 0, 0xaa, 0xbb, 1, 0, 0, 0, 2, 0, 100, 0]);
+        assert!(heap.find_entry(HeapId::new(1, 1).unwrap()).is_err());
+    }
+
+    #[test]
+    fn heap_allocation_cannot_overlap_page_map_or_header() {
+        let heap = heap_with_page(vec![4, 0, 0xaa, 0xbb, 1, 0, 0, 0, 2, 0, 6, 0]);
+        assert!(heap.find_entry(HeapId::new(1, 1).unwrap()).is_err());
+        let heap = heap_with_page(vec![4, 0, 0xaa, 0xbb, 1, 0, 0, 0, 0, 0, 2, 0]);
+        assert!(heap.find_entry(HeapId::new(1, 1).unwrap()).is_err());
+    }
+
+    #[test]
+    fn heap_allocation_at_data_boundary_is_valid() {
+        let heap = heap_with_page(vec![4, 0, 0xaa, 0xbb, 1, 0, 0, 0, 2, 0, 4, 0]);
+        assert_eq!(
+            heap.find_entry(HeapId::new(1, 1).unwrap()).unwrap(),
+            &[0xaa, 0xbb]
+        );
+    }
+
+    #[test]
+    fn heap_allocation_count_must_fit_page_map() {
+        let heap = heap_with_page(vec![4, 0, 0xaa, 0xbb, 0xff, 0xff, 0, 0]);
+        assert!(heap.find_entry(HeapId::new(1, 1).unwrap()).is_err());
     }
 }

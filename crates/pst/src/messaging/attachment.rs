@@ -6,12 +6,12 @@ use super::{message::*, read_write::*, *};
 use crate::{
     ltp::{
         heap::HeapNode,
-        prop_context::{BinaryValue, PropertyContext, PropertyValue},
+        prop_context::{PropertyContext, PropertyTreeRecordValue, PropertyValue},
         prop_type::PropertyType,
         read_write::*,
     },
     ndb::{
-        block::{DataTree, IntermediateTreeBlock},
+        block::{DataTree, IntermediateTreeBlock, LeafSubNodeTreeEntry, SubNodeTree},
         block_id::BlockId,
         header::Header,
         node_id::{NodeId, NodeIdType},
@@ -19,7 +19,7 @@ use crate::{
         read_write::*,
         root::Root,
     },
-    AnsiPstFile, PstFile, PstFileLock, UnicodePstFile,
+    AnsiPstFile, PstFile, PstFileLock, PstFileReadWriteBlockBTree, PstReader, UnicodePstFile,
 };
 
 #[derive(Default, Debug)]
@@ -126,15 +126,16 @@ impl TryFrom<i32> for AttachmentMethod {
     }
 }
 
-pub enum AttachmentData {
-    Binary(BinaryValue),
-    Message(Rc<dyn Message>),
-}
-
+/// Attachment metadata is read eagerly. Binary property 0x3701 is accessed through
+/// `copy_data` without retaining the payload in memory.
 pub trait Attachment {
     fn message(&self) -> Rc<dyn Message>;
     fn properties(&self) -> &AttachmentProperties;
-    fn data(&self) -> Option<&AttachmentData>;
+    fn embedded_message(&self) -> Option<&Rc<dyn Message>>;
+    /// Copies a by-value or storage payload. Other attachment methods return `None`.
+    /// A failed copy may have written a prefix. Payload/work limits and cancellation
+    /// are enforced through the store's read control. No complete payload is cached.
+    fn copy_data(&self, writer: &mut dyn io::Write) -> io::Result<Option<u64>>;
 }
 
 struct AttachmentInner<Pst>
@@ -142,8 +143,23 @@ where
     Pst: PstFile,
 {
     message: Rc<Pst::Message>,
+    node: Pst::NodeBTreeEntry,
     properties: AttachmentProperties,
-    data: Option<AttachmentData>,
+    content: AttachmentContent<Pst>,
+}
+
+/// `PidTagAttachDataBinary`/`PidTagAttachDataObject`: the attachment payload.
+const ATTACH_DATA: u16 = 0x3701;
+
+/// Where an attachment's payload lives, resolved when the attachment is opened.
+enum AttachmentContent<Pst: PstFile> {
+    /// The attachment method has no payload, e.g. a reference.
+    None,
+    /// Binary property 0x3701, streamed by `copy_data`.
+    Binary(PropertyTreeRecordValue),
+    /// A storage object in the attachment's subnode tree, streamed by `copy_data`.
+    Storage(Pst::BlockId),
+    Embedded(Rc<dyn Message>),
 }
 
 impl<Pst> AttachmentInner<Pst>
@@ -177,6 +193,13 @@ where
     <<Pst as PstFile>::DataTreeBlock as IntermediateTreeBlock>::Entry:
         IntermediateTreeEntryReadWrite,
     <Pst as PstFile>::DataBlock: BlockReadWrite + Clone,
+    <Pst as PstFile>::SubNodeTreeBlockHeader: IntermediateTreeHeaderReadWrite,
+    <Pst as PstFile>::SubNodeTreeBlock: IntermediateTreeBlockReadWrite,
+    <<Pst as PstFile>::SubNodeTreeBlock as IntermediateTreeBlock>::Entry:
+        IntermediateTreeEntryReadWrite,
+    <Pst as PstFile>::SubNodeBlock: IntermediateTreeBlockReadWrite,
+    <<Pst as PstFile>::SubNodeBlock as IntermediateTreeBlock>::Entry:
+        IntermediateTreeEntryReadWrite,
     <Pst as PstFile>::HeapNode: HeapNodeReadWrite<Pst>,
     <Pst as PstFile>::PropertyTree: HeapTreeReadWrite<Pst>,
     <Pst as PstFile>::PropertyContext: PropertyContextReadWrite<Pst>,
@@ -198,168 +221,208 @@ where
 
         let store = message.pst_store();
         let pst = store.pst();
-        let header = pst.header();
-        let root = header.root();
+        pst.read_control().charge(1)?;
+        let entry = message
+            .sub_nodes()
+            .get(&sub_node)
+            .ok_or(MessagingError::AttachmentSubNodeNotFound(sub_node))?;
+        let node = <<Pst as PstFile>::NodeBTreeEntry as NodeBTreeEntryReadWrite>::new(
+            entry.node(),
+            entry.block(),
+            entry.sub_node(),
+            None,
+        );
 
-        let (properties, data) = {
-            let mut file = pst
-                .reader()
-                .lock()
-                .map_err(|_| MessagingError::FailedToLockFile)?;
-            let file = &mut *file;
-
-            let encoding = header.crypt_method();
-            let block_btree = <<Pst as PstFile>::BlockBTree as RootBTreeReadWrite>::read(
-                file,
-                *root.block_btree(),
-            )?;
-
-            let node = message
-                .sub_nodes()
-                .get(&sub_node)
-                .ok_or(MessagingError::AttachmentSubNodeNotFound(sub_node))?;
-            let node = <<Pst as PstFile>::NodeBTreeEntry as NodeBTreeEntryReadWrite>::new(
-                node.node(),
-                node.block(),
-                node.sub_node(),
-                None,
-            );
-
-            let mut page_cache = pst.block_cache();
-            let data = node.data();
-            let heap = <<Pst as PstFile>::HeapNode as HeapNodeReadWrite<Pst>>::read(
-                file,
-                &block_btree,
-                &mut page_cache,
-                encoding,
-                data.search_key(),
-            )?;
-            let header = heap.header()?;
-
-            let tree = <Pst as PstFile>::PropertyTree::new(heap, header.user_root());
-            let prop_context = <<Pst as PstFile>::PropertyContext as PropertyContextReadWrite<
-                Pst,
-            >>::new(node, tree);
-            let properties = prop_context
-                .properties()?
-                .into_iter()
-                .map(|(prop_id, record)| {
-                    prop_context
-                        .read_property(file, encoding, &block_btree, &mut page_cache, record)
-                        .map(|value| (prop_id, value))
-                })
-                .collect::<io::Result<BTreeMap<_, _>>>()?;
-            let properties = AttachmentProperties { properties };
-
-            let attachment_method = AttachmentMethod::try_from(properties.attachment_method()?)?;
-            let data = match attachment_method {
-                AttachmentMethod::ByValue => {
-                    let binary_data = match properties
-                        .get(0x3701)
-                        .ok_or(MessagingError::AttachmentMessageObjectDataNotFound)?
-                    {
-                        PropertyValue::Binary(value) => value,
-                        invalid => {
-                            return Err(MessagingError::InvalidMessageObjectData(
-                                PropertyType::from(invalid),
-                            )
-                            .into())
-                        }
-                    };
-                    Some(AttachmentData::Binary(binary_data.clone()))
+        let (properties, binary) = Self::read_properties(pst, node)?;
+        let method = AttachmentMethod::try_from(properties.attachment_method()?)?;
+        let content = match method {
+            AttachmentMethod::ByValue => match binary {
+                Some(record) => AttachmentContent::Binary(record),
+                None => {
+                    let value = properties
+                        .get(ATTACH_DATA)
+                        .ok_or(MessagingError::AttachmentMessageObjectDataNotFound)?;
+                    return Err(MessagingError::InvalidMessageObjectData(PropertyType::from(
+                        value,
+                    ))
+                    .into());
                 }
-                AttachmentMethod::EmbeddedMessage => {
-                    let object_data = match properties
-                        .get(0x3701)
-                        .ok_or(MessagingError::AttachmentMessageObjectDataNotFound)?
-                    {
-                        PropertyValue::Object(value) => value,
-                        invalid => {
-                            return Err(MessagingError::InvalidMessageObjectData(
-                                PropertyType::from(invalid),
-                            )
-                            .into())
-                        }
-                    };
-
-                    let sub_node = object_data.node();
-                    let node = message
-                        .sub_nodes()
-                        .get(&sub_node)
-                        .ok_or(MessagingError::AttachmentSubNodeNotFound(sub_node))?;
+            },
+            AttachmentMethod::EmbeddedMessage | AttachmentMethod::Storage => {
+                let object = match properties
+                    .get(ATTACH_DATA)
+                    .ok_or(MessagingError::AttachmentMessageObjectDataNotFound)?
+                {
+                    PropertyValue::Object(object) => object,
+                    invalid => {
+                        return Err(MessagingError::InvalidMessageObjectData(PropertyType::from(
+                            invalid,
+                        ))
+                        .into())
+                    }
+                };
+                let entry = Self::find_object(pst, node, object.node())?;
+                if method == AttachmentMethod::Storage {
+                    AttachmentContent::Storage(entry.block())
+                } else {
+                    // The file lock has been released, so the embedded message can take it.
                     let node = <<Pst as PstFile>::NodeBTreeEntry as NodeBTreeEntryReadWrite>::new(
-                        node.node(),
-                        node.block(),
-                        node.sub_node(),
+                        entry.node(),
+                        entry.block(),
+                        entry.sub_node(),
                         None,
                     );
-                    let message =
-                        <<Pst as PstFile>::Message as MessageReadWrite<Pst>>::read_embedded(
-                            store.clone(),
-                            node,
-                            prop_ids,
-                        )?;
-                    Some(AttachmentData::Message(message))
+                    let embedded = <Pst::Message as MessageReadWrite<Pst>>::read_embedded(
+                        store.clone(),
+                        node,
+                        prop_ids,
+                        message.depth() + 1,
+                    )?;
+                    AttachmentContent::Embedded(embedded)
                 }
-                AttachmentMethod::Storage => {
-                    let object_data = match properties
-                        .get(0x3701)
-                        .ok_or(MessagingError::AttachmentMessageObjectDataNotFound)?
-                    {
-                        PropertyValue::Object(value) => value,
-                        invalid => {
-                            return Err(MessagingError::InvalidMessageObjectData(
-                                PropertyType::from(invalid),
-                            )
-                            .into())
-                        }
-                    };
-                    let sub_node = object_data.node();
-                    let node = message
-                        .sub_nodes()
-                        .get(&sub_node)
-                        .ok_or(MessagingError::AttachmentSubNodeNotFound(sub_node))?;
-                    let block =
-                        block_btree.find_entry(file, node.block().search_key(), &mut page_cache)?;
-                    let block = DataTree::read(file, encoding, &block)?;
-                    let mut data = vec![];
-                    let _ = block
-                        .reader(
-                            file,
-                            encoding,
-                            &block_btree,
-                            &mut page_cache,
-                            &mut Default::default(),
-                        )?
-                        .read_to_end(&mut data)?;
-                    Some(AttachmentData::Binary(BinaryValue::new(data)))
-                }
-                _ => None,
-            };
-
-            (properties, data)
+            }
+            _ => AttachmentContent::None,
         };
 
         Ok(Self {
             message,
+            node,
             properties,
-            data,
+            content,
         })
+    }
+
+    /// Reads the attachment's metadata. The binary payload, if any, is returned as an
+    /// unread record so that it can be streamed later.
+    fn read_properties(
+        pst: &Pst,
+        node: <Pst as PstFile>::NodeBTreeEntry,
+    ) -> io::Result<(AttachmentProperties, Option<PropertyTreeRecordValue>)> {
+        let control = pst.read_control();
+        let encoding = pst.header().crypt_method();
+        Self::with_file(pst, |file, block_btree, page_cache| {
+            let prop_context = Self::property_context(pst, file, block_btree, page_cache, node)?;
+            let mut binary = None;
+            let mut retained = 0;
+            let mut properties = BTreeMap::new();
+            for (prop_id, record) in prop_context.properties()? {
+                control.charge(1)?;
+                if prop_id == ATTACH_DATA && record.prop_type() == PropertyType::Binary {
+                    binary = Some(record);
+                    continue;
+                }
+                let value =
+                    prop_context.read_property(file, encoding, block_btree, page_cache, record)?;
+                retain_property(&mut properties, &mut retained, prop_id, value, control)?;
+            }
+            Ok((AttachmentProperties { properties }, binary))
+        })
+    }
+
+    /// Finds an object stored in the attachment's own subnode tree.
+    fn find_object(
+        pst: &Pst,
+        node: <Pst as PstFile>::NodeBTreeEntry,
+        object: NodeId,
+    ) -> io::Result<LeafSubNodeTreeEntry<<Pst as PstFile>::BlockId>> {
+        let control = pst.read_control();
+        let sub_nodes = node
+            .sub_node()
+            .ok_or(MessagingError::AttachmentSubNodeNotFound(object))?;
+        Self::with_file(pst, |file, block_btree, page_cache| {
+            let block =
+                block_btree.find_entry(file, sub_nodes.search_key(), page_cache, control)?;
+            SubNodeTree::<Pst>::read(file, &block, control)?
+                .entries(file, block_btree, page_cache, control)?
+                .find(|entry| entry.node() == object)
+                .ok_or_else(|| MessagingError::AttachmentSubNodeNotFound(object).into())
+        })
+    }
+
+    fn property_context(
+        pst: &Pst,
+        file: &mut Box<dyn PstReader>,
+        block_btree: &PstFileReadWriteBlockBTree<Pst>,
+        page_cache: &mut RootBTreePageCache<<Pst as PstFile>::BlockBTree>,
+        node: <Pst as PstFile>::NodeBTreeEntry,
+    ) -> io::Result<<Pst as PstFile>::PropertyContext> {
+        let heap = <<Pst as PstFile>::HeapNode as HeapNodeReadWrite<Pst>>::read(
+            file,
+            block_btree,
+            page_cache,
+            pst.header().crypt_method(),
+            node.data().search_key(),
+            pst.read_control(),
+        )?;
+        let user_root = heap.header()?.user_root();
+        let tree = <Pst as PstFile>::PropertyTree::new(heap, user_root);
+        Ok(<Pst as PstFile>::PropertyContext::new(node, tree))
+    }
+
+    /// Runs `read` while holding the file lock.
+    fn with_file<T>(
+        pst: &Pst,
+        read: impl FnOnce(
+            &mut Box<dyn PstReader>,
+            &PstFileReadWriteBlockBTree<Pst>,
+            &mut RootBTreePageCache<<Pst as PstFile>::BlockBTree>,
+        ) -> io::Result<T>,
+    ) -> io::Result<T> {
+        let mut file = pst
+            .reader()
+            .lock()
+            .map_err(|_| MessagingError::FailedToLockFile)?;
+        let block_btree = <<Pst as PstFile>::BlockBTree as RootBTreeReadWrite>::read(
+            &mut *file,
+            *pst.header().root().block_btree(),
+        )?;
+        read(&mut file, &block_btree, &mut pst.block_cache())
+    }
+
+    fn embedded_message(&self) -> Option<&Rc<dyn Message>> {
+        match &self.content {
+            AttachmentContent::Embedded(message) => Some(message),
+            _ => None,
+        }
+    }
+
+    fn copy_data(&self, writer: &mut dyn io::Write) -> io::Result<Option<u64>> {
+        let pst = self.message.pst_store().pst();
+        let control = pst.read_control();
+        control.charge(1)?;
+        let encoding = pst.header().crypt_method();
+        match &self.content {
+            AttachmentContent::Binary(record) => {
+                Self::with_file(pst, |file, block_btree, page_cache| {
+                    Self::property_context(pst, file, block_btree, page_cache, self.node)?
+                        .copy_binary_property(
+                            file,
+                            encoding,
+                            block_btree,
+                            page_cache,
+                            *record,
+                            writer,
+                        )
+                })
+            }
+            AttachmentContent::Storage(block) => {
+                Self::with_file(pst, |file, block_btree, page_cache| {
+                    let block =
+                        block_btree.find_entry(file, block.search_key(), page_cache, control)?;
+                    let tree = DataTree::<Pst>::read(file, encoding, &block, control)?;
+                    let mut reader =
+                        tree.reader(file, encoding, block_btree, page_cache, control)?;
+                    control.copy_to(&mut reader, writer)
+                })
+            }
+            AttachmentContent::Embedded(_) | AttachmentContent::None => return Ok(None),
+        }
+        .map(Some)
     }
 }
 
 pub struct UnicodeAttachment {
     inner: AttachmentInner<UnicodePstFile>,
-}
-
-impl UnicodeAttachment {
-    pub fn read(
-        message: Rc<UnicodeMessage>,
-        sub_node: NodeId,
-        prop_ids: Option<&[u16]>,
-    ) -> io::Result<Rc<Self>> {
-        <Self as AttachmentReadWrite<UnicodePstFile>>::read(message, sub_node, prop_ids)
-    }
 }
 
 impl Attachment for UnicodeAttachment {
@@ -371,8 +434,12 @@ impl Attachment for UnicodeAttachment {
         &self.inner.properties
     }
 
-    fn data(&self) -> Option<&AttachmentData> {
-        self.inner.data.as_ref()
+    fn embedded_message(&self) -> Option<&Rc<dyn Message>> {
+        self.inner.embedded_message()
+    }
+
+    fn copy_data(&self, writer: &mut dyn io::Write) -> io::Result<Option<u64>> {
+        self.inner.copy_data(writer)
     }
 }
 
@@ -391,16 +458,6 @@ pub struct AnsiAttachment {
     inner: AttachmentInner<AnsiPstFile>,
 }
 
-impl AnsiAttachment {
-    pub fn read(
-        message: Rc<AnsiMessage>,
-        sub_node: NodeId,
-        prop_ids: Option<&[u16]>,
-    ) -> io::Result<Rc<Self>> {
-        <Self as AttachmentReadWrite<AnsiPstFile>>::read(message, sub_node, prop_ids)
-    }
-}
-
 impl Attachment for AnsiAttachment {
     fn message(&self) -> Rc<dyn Message> {
         self.inner.message.clone()
@@ -410,8 +467,12 @@ impl Attachment for AnsiAttachment {
         &self.inner.properties
     }
 
-    fn data(&self) -> Option<&AttachmentData> {
-        self.inner.data.as_ref()
+    fn embedded_message(&self) -> Option<&Rc<dyn Message>> {
+        self.inner.embedded_message()
+    }
+
+    fn copy_data(&self, writer: &mut dyn io::Write) -> io::Result<Option<u64>> {
+        self.inner.copy_data(writer)
     }
 }
 

@@ -3,7 +3,6 @@
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use core::mem;
 use std::{
-    cell::RefCell,
     collections::BTreeMap,
     fmt::{Debug, Display},
     io::{self, Cursor, Read, Write},
@@ -12,18 +11,18 @@ use std::{
 use super::{heap::*, prop_type::*, read_write::*, tree::*, *};
 use crate::{
     ndb::{
-        block::{DataBlockCache, DataTree, IntermediateTreeBlock, SubNodeTree},
+        block::{DataTree, IntermediateTreeBlock, SubNodeTree},
         block_id::BlockId,
-        block_ref::BlockRef,
         header::NdbCryptMethod,
         node_id::{NodeId, NodeIdType},
         page::{
-            AnsiBlockBTree, AnsiNodeBTreeEntry, BlockBTreeEntry, NodeBTreeEntry, RootBTree,
-            UnicodeBlockBTree, UnicodeNodeBTreeEntry,
+            AnsiBlockBTree, AnsiNodeBTreeEntry, NodeBTreeEntry, RootBTree, UnicodeBlockBTree,
+            UnicodeNodeBTreeEntry,
         },
         read_write::*,
     },
-    AnsiPstFile, PstFile, PstFileReadWriteBlockBTree, PstReader, UnicodePstFile,
+    read_control::MAP_ENTRY_OVERHEAD,
+    AnsiPstFile, PstFile, PstFileReadWriteBlockBTree, PstReader, ReadControl, UnicodePstFile,
 };
 
 #[derive(Copy, Clone)]
@@ -476,307 +475,251 @@ impl From<&PropertyValue> for PropertyType {
     }
 }
 
-impl PropertyValueReadWrite for PropertyValue {
-    fn read(f: &mut dyn Read, prop_type: PropertyType) -> io::Result<Self> {
+/// Decodes a property made of consecutive `width`-byte values.
+fn read_fixed_values<T>(
+    f: &mut dyn Read,
+    control: &ReadControl,
+    width: usize,
+    mut decode: impl FnMut(&mut &[u8]) -> io::Result<T>,
+) -> io::Result<Vec<T>> {
+    let data = control.read_to_vec(f)?;
+    if data.len() % width != 0 {
+        return Err(io::ErrorKind::UnexpectedEof.into());
+    }
+    let mut values = Vec::new();
+    control.reserve(&mut values, data.len() / width)?;
+    for mut chunk in data.chunks_exact(width) {
+        values.push(decode(&mut chunk)?);
+    }
+    Ok(values)
+}
+
+/// Decodes a multi-valued variable-size property: a count, item offsets, then the items.
+fn read_variable_values<T>(
+    f: &mut dyn Read,
+    control: &ReadControl,
+    mut decode: impl FnMut(&[u8]) -> io::Result<T>,
+) -> io::Result<Vec<T>> {
+    let data = control.read_to_vec(f)?;
+    let items = multi_value_items(&data, control)?;
+    // Decoded values copy at most the item bytes, which share the limit with the values.
+    let mut values = Vec::new();
+    control.reserve_within(&mut values, items.len(), data.len())?;
+    for item in items {
+        values.push(decode(item)?);
+    }
+    Ok(values)
+}
+
+fn multi_value_items<'a>(data: &'a [u8], control: &ReadControl) -> io::Result<Vec<&'a [u8]>> {
+    let mut cursor = Cursor::new(data);
+    let count = cursor.read_u32::<LittleEndian>()? as usize;
+    let start = count
+        .checked_add(1)
+        .and_then(|count| count.checked_mul(mem::size_of::<u32>()))
+        .filter(|start| *start <= data.len())
+        .ok_or(LtpError::InvalidMultiValuePropertyCount(count))?;
+    if count == 0 && start != data.len() {
+        return Err(LtpError::InvalidMultiValuePropertyCount(count).into());
+    }
+    control.charge(count)?;
+    let mut items = Vec::new();
+    control.reserve(&mut items, count)?;
+    let mut previous = start;
+    for index in 0..count {
+        let offset = cursor.read_u32::<LittleEndian>()? as usize;
+        if offset < previous || offset > data.len() || (index == 0 && offset != start) {
+            return Err(LtpError::InvalidMultiValuePropertyOffset(offset).into());
+        }
+        if let Some(last) = items.last_mut() {
+            *last = &data[previous..offset];
+        }
+        items.push(&data[offset..]);
+        previous = offset;
+    }
+    Ok(items)
+}
+
+fn read_guid(f: &mut dyn Read) -> io::Result<GuidValue> {
+    let data1 = f.read_u32::<LittleEndian>()?;
+    let data2 = f.read_u16::<LittleEndian>()?;
+    let data3 = f.read_u16::<LittleEndian>()?;
+    let mut data4 = [0; 8];
+    f.read_exact(&mut data4)?;
+    Ok(GuidValue {
+        data1,
+        data2,
+        data3,
+        data4,
+    })
+}
+
+fn truncate_at_nul<T: Default + PartialEq>(values: &[T]) -> &[T] {
+    let end = values
+        .iter()
+        .position(|value| *value == T::default())
+        .unwrap_or(values.len());
+    &values[..end]
+}
+
+impl PropertyValue {
+    /// Bytes retained by this value, including its inline representation and vector capacities.
+    pub(crate) fn allocation_size(&self) -> usize {
+        fn bytes<T>(values: &Vec<T>) -> usize {
+            values.capacity().saturating_mul(mem::size_of::<T>())
+        }
+        fn nested<T>(values: &Vec<T>, buffer: impl Fn(&T) -> usize) -> usize {
+            values.iter().fold(bytes(values), |total, value| {
+                total.saturating_add(buffer(value))
+            })
+        }
+        let dynamic = match self {
+            Self::String8(value) => bytes(&value.buffer),
+            Self::Unicode(value) => bytes(&value.buffer),
+            Self::Binary(value) => bytes(&value.buffer),
+            Self::MultipleInteger16(values) => bytes(values),
+            Self::MultipleInteger32(values) => bytes(values),
+            Self::MultipleFloating32(values) => bytes(values),
+            Self::MultipleFloating64(values) | Self::MultipleFloatingTime(values) => bytes(values),
+            Self::MultipleCurrency(values)
+            | Self::MultipleInteger64(values)
+            | Self::MultipleTime(values) => bytes(values),
+            Self::MultipleGuid(values) => bytes(values),
+            Self::MultipleString8(values) => nested(values, |value| bytes(&value.buffer)),
+            Self::MultipleUnicode(values) => nested(values, |value| bytes(&value.buffer)),
+            Self::MultipleBinary(values) => nested(values, |value| bytes(&value.buffer)),
+            _ => 0,
+        };
+        mem::size_of::<Self>().saturating_add(dynamic)
+    }
+
+    pub(crate) fn read_with_control(
+        f: &mut dyn Read,
+        prop_type: PropertyType,
+        control: &ReadControl,
+    ) -> io::Result<Self> {
+        control.charge(1)?;
         match prop_type {
-            PropertyType::Floating64 => {
-                let value = f.read_f64::<LittleEndian>()?;
-                Ok(Self::Floating64(value))
-            }
-
-            PropertyType::Currency => {
-                let value = f.read_i64::<LittleEndian>()?;
-                Ok(Self::Currency(value))
-            }
-
-            PropertyType::FloatingTime => {
-                let value = f.read_f64::<LittleEndian>()?;
-                Ok(Self::FloatingTime(value))
-            }
-
-            PropertyType::Integer64 => {
-                let value = f.read_i64::<LittleEndian>()?;
-                Ok(Self::Integer64(value))
-            }
-
+            PropertyType::Floating64 => Ok(Self::Floating64(f.read_f64::<LittleEndian>()?)),
+            PropertyType::Currency => Ok(Self::Currency(f.read_i64::<LittleEndian>()?)),
+            PropertyType::FloatingTime => Ok(Self::FloatingTime(f.read_f64::<LittleEndian>()?)),
+            PropertyType::Integer64 => Ok(Self::Integer64(f.read_i64::<LittleEndian>()?)),
+            PropertyType::Time => Ok(Self::Time(f.read_i64::<LittleEndian>()?)),
             PropertyType::String8 => {
-                let mut buffer = Vec::new();
-                f.read_to_end(&mut buffer)?;
-                if let Some(end) = buffer.iter().position(|&b| b == 0) {
-                    buffer.truncate(end);
-                }
+                let mut buffer = control.read_to_vec(f)?;
+                buffer.truncate(truncate_at_nul(&buffer).len());
                 Ok(Self::String8(String8Value { buffer }))
             }
-
             PropertyType::Unicode => {
-                let mut buffer = Vec::new();
-                while let Ok(ch) = f.read_u16::<LittleEndian>() {
-                    if ch == 0 {
-                        break;
-                    }
-                    buffer.push(ch);
-                }
+                let mut buffer =
+                    read_fixed_values(f, control, 2, |r| r.read_u16::<LittleEndian>())?;
+                buffer.truncate(truncate_at_nul(&buffer).len());
                 Ok(Self::Unicode(UnicodeValue { buffer }))
             }
-
-            PropertyType::Time => {
-                let value = f.read_i64::<LittleEndian>()?;
-                Ok(Self::Time(value))
-            }
-
-            PropertyType::Guid => {
-                let data1 = f.read_u32::<LittleEndian>()?;
-                let data2 = f.read_u16::<LittleEndian>()?;
-                let data3 = f.read_u16::<LittleEndian>()?;
-                let mut data4 = [0; 8];
-                f.read_exact(&mut data4)?;
-                Ok(Self::Guid(GuidValue {
-                    data1,
-                    data2,
-                    data3,
-                    data4,
-                }))
-            }
-
-            PropertyType::Binary => {
-                let mut buffer = Vec::new();
-                f.read_to_end(&mut buffer)?;
-                Ok(Self::Binary(BinaryValue { buffer }))
-            }
-
-            PropertyType::Object => {
-                let node_id = NodeId::read(f)?;
-                let size = f.read_u32::<LittleEndian>()?;
-                Ok(Self::Object(ObjectValue { node_id, size }))
-            }
-
-            PropertyType::MultipleInteger16 => {
-                let mut values = Vec::new();
-                while let Ok(value) = f.read_i16::<LittleEndian>() {
-                    values.push(value);
-                }
-                Ok(Self::MultipleInteger16(values))
-            }
-
-            PropertyType::MultipleInteger32 => {
-                let mut values = Vec::new();
-                while let Ok(value) = f.read_i32::<LittleEndian>() {
-                    values.push(value);
-                }
-                Ok(Self::MultipleInteger32(values))
-            }
-
-            PropertyType::MultipleFloating32 => {
-                let mut values = Vec::new();
-                while let Ok(value) = f.read_f32::<LittleEndian>() {
-                    values.push(value);
-                }
-                Ok(Self::MultipleFloating32(values))
-            }
-
-            PropertyType::MultipleFloating64 => {
-                let mut values = Vec::new();
-                while let Ok(value) = f.read_f64::<LittleEndian>() {
-                    values.push(value);
-                }
-                Ok(Self::MultipleFloating64(values))
-            }
-
-            PropertyType::MultipleCurrency => {
-                let mut values = Vec::new();
-                while let Ok(value) = f.read_i64::<LittleEndian>() {
-                    values.push(value);
-                }
-                Ok(Self::MultipleCurrency(values))
-            }
-
-            PropertyType::MultipleFloatingTime => {
-                let mut values = Vec::new();
-                while let Ok(value) = f.read_f64::<LittleEndian>() {
-                    values.push(value);
-                }
-                Ok(Self::MultipleFloatingTime(values))
-            }
-
-            PropertyType::MultipleInteger64 => {
-                let mut values = Vec::new();
-                while let Ok(value) = f.read_i64::<LittleEndian>() {
-                    values.push(value);
-                }
-                Ok(Self::MultipleInteger64(values))
-            }
-
-            PropertyType::MultipleString8 => {
-                // ulCount
-                let count = f.read_u32::<LittleEndian>()? as usize;
-
-                // rgulDataOffsets
-                let mut offsets = Vec::with_capacity(count);
-                for _ in 0..count {
-                    offsets.push(f.read_u32::<LittleEndian>()? as usize);
-                }
-
-                // rgDataItems
-                let mut start = (offsets.len() + 1) * mem::size_of::<u32>();
-                let mut values = Vec::with_capacity(offsets.len());
-                for i in 0..offsets.len() {
-                    let next = offsets[i];
-                    if next != start {
-                        return Err(LtpError::InvalidMultiValuePropertyOffset(next).into());
-                    }
-
-                    let mut buffer = if i < offsets.len() - 1 {
-                        let next = offsets[i + 1];
-                        if next < start {
-                            return Err(LtpError::InvalidMultiValuePropertyOffset(next).into());
-                        }
-
-                        if next > start {
-                            let mut buffer = vec![0; next - start];
-                            start = next;
-                            f.read_exact(&mut buffer)?;
-                            buffer
-                        } else {
-                            Default::default()
-                        }
-                    } else {
-                        let mut buffer = Vec::new();
-                        f.read_to_end(&mut buffer)?;
-                        buffer
-                    };
-
-                    if let Some(end) = buffer.iter().position(|&b| b == 0) {
-                        buffer.truncate(end);
-                    }
-
-                    values.push(String8Value { buffer });
-                }
-
-                Ok(Self::MultipleString8(values))
-            }
-
-            PropertyType::MultipleUnicode => {
-                // ulCount
-                let count = f.read_u32::<LittleEndian>()? as usize;
-
-                // rgulDataOffsets
-                let mut offsets = Vec::with_capacity(count);
-                for _ in 0..count {
-                    offsets.push(f.read_u32::<LittleEndian>()? as usize);
-                }
-
-                // rgDataItems
-                let mut start = (offsets.len() + 1) * mem::size_of::<u32>();
-                let mut values = Vec::with_capacity(offsets.len());
-                for i in 0..offsets.len() {
-                    let next = offsets[i];
-                    if next != start {
-                        return Err(LtpError::InvalidMultiValuePropertyOffset(next).into());
-                    }
-
-                    let mut buffer = Vec::new();
-                    if i < offsets.len() - 1 {
-                        let next = offsets[i + 1];
-                        if next < start {
-                            return Err(LtpError::InvalidMultiValuePropertyOffset(next).into());
-                        }
-
-                        while start < next {
-                            let ch = f.read_u16::<LittleEndian>()?;
-                            buffer.push(ch);
-                            start += mem::size_of::<u16>();
-                        }
-                    } else {
-                        while let Ok(ch) = f.read_u16::<LittleEndian>() {
-                            buffer.push(ch);
-                        }
-                    };
-
-                    if let Some(end) = buffer.iter().position(|&ch| ch == 0) {
-                        buffer.truncate(end);
-                    }
-
-                    values.push(UnicodeValue { buffer });
-                }
-
-                Ok(Self::MultipleUnicode(values))
-            }
-
+            PropertyType::Guid => Ok(Self::Guid(read_guid(f)?)),
+            PropertyType::Binary => Ok(Self::Binary(BinaryValue {
+                buffer: control.read_to_vec(f)?,
+            })),
+            PropertyType::Object => Ok(Self::Object(ObjectValue {
+                node_id: NodeId::read(f)?,
+                size: f.read_u32::<LittleEndian>()?,
+            })),
+            PropertyType::MultipleInteger16 => Ok(Self::MultipleInteger16(read_fixed_values(
+                f,
+                control,
+                2,
+                |r| r.read_i16::<LittleEndian>(),
+            )?)),
+            PropertyType::MultipleInteger32 => Ok(Self::MultipleInteger32(read_fixed_values(
+                f,
+                control,
+                4,
+                |r| r.read_i32::<LittleEndian>(),
+            )?)),
+            PropertyType::MultipleFloating32 => Ok(Self::MultipleFloating32(read_fixed_values(
+                f,
+                control,
+                4,
+                |r| r.read_f32::<LittleEndian>(),
+            )?)),
+            PropertyType::MultipleFloating64 => Ok(Self::MultipleFloating64(read_fixed_values(
+                f,
+                control,
+                8,
+                |r| r.read_f64::<LittleEndian>(),
+            )?)),
+            PropertyType::MultipleCurrency => Ok(Self::MultipleCurrency(read_fixed_values(
+                f,
+                control,
+                8,
+                |r| r.read_i64::<LittleEndian>(),
+            )?)),
+            PropertyType::MultipleFloatingTime => Ok(Self::MultipleFloatingTime(
+                read_fixed_values(f, control, 8, |r| r.read_f64::<LittleEndian>())?,
+            )),
+            PropertyType::MultipleInteger64 => Ok(Self::MultipleInteger64(read_fixed_values(
+                f,
+                control,
+                8,
+                |r| r.read_i64::<LittleEndian>(),
+            )?)),
             PropertyType::MultipleTime => {
-                let mut values = Vec::new();
-                while let Ok(value) = f.read_i64::<LittleEndian>() {
-                    values.push(value);
-                }
-                Ok(Self::MultipleTime(values))
+                Ok(Self::MultipleTime(read_fixed_values(f, control, 8, |r| {
+                    r.read_i64::<LittleEndian>()
+                })?))
             }
-
             PropertyType::MultipleGuid => {
                 let count = f.read_u32::<LittleEndian>()? as usize;
-                let mut values = Vec::with_capacity(count);
-                for _ in 0..count {
-                    let data1 = f.read_u32::<LittleEndian>()?;
-                    let data2 = f.read_u16::<LittleEndian>()?;
-                    let data3 = f.read_u16::<LittleEndian>()?;
-                    let mut data4 = [0; 8];
-                    f.read_exact(&mut data4)?;
-                    values.push(GuidValue {
-                        data1,
-                        data2,
-                        data3,
-                        data4,
-                    });
+                let values = read_fixed_values(f, control, 16, |r| read_guid(r))?;
+                if values.len() != count {
+                    return Err(LtpError::InvalidMultiValuePropertyCount(count).into());
                 }
-
                 Ok(Self::MultipleGuid(values))
             }
-
-            PropertyType::MultipleBinary => {
-                // ulCount
-                let count = f.read_u32::<LittleEndian>()? as usize;
-
-                // rgulDataOffsets
-                let mut offsets = Vec::with_capacity(count);
-                for _ in 0..count {
-                    offsets.push(f.read_u32::<LittleEndian>()? as usize);
-                }
-
-                // rgDataItems
-                let mut start = (offsets.len() + 1) * mem::size_of::<u32>();
-                let mut values = Vec::with_capacity(offsets.len());
-                for i in 0..offsets.len() {
-                    let next = offsets[i];
-                    if next != start {
-                        return Err(LtpError::InvalidMultiValuePropertyOffset(next).into());
+            PropertyType::MultipleString8 => Ok(Self::MultipleString8(read_variable_values(
+                f,
+                control,
+                |item| {
+                    Ok(String8Value {
+                        buffer: truncate_at_nul(item).to_vec(),
+                    })
+                },
+            )?)),
+            PropertyType::MultipleUnicode => Ok(Self::MultipleUnicode(read_variable_values(
+                f,
+                control,
+                |item| {
+                    if item.len() % 2 != 0 {
+                        return Err(LtpError::InvalidMultiValuePropertyOffset(item.len()).into());
                     }
-
-                    let buffer = if i < offsets.len() - 1 {
-                        let next = offsets[i + 1];
-                        if next < start {
-                            return Err(LtpError::InvalidMultiValuePropertyOffset(next).into());
-                        }
-
-                        if next > start {
-                            let mut buffer = vec![0; next - start];
-                            start = next;
-                            f.read_exact(&mut buffer)?;
-                            buffer
-                        } else {
-                            Default::default()
-                        }
-                    } else {
-                        let mut buffer = Vec::new();
-                        f.read_to_end(&mut buffer)?;
-                        buffer
-                    };
-
-                    values.push(BinaryValue { buffer });
-                }
-
-                Ok(Self::MultipleBinary(values))
-            }
-
+                    // Reserve exactly: `take_while` has no size hint, so collecting it would
+                    // grow past the item's encoded size, which the outer reservation budgets.
+                    let mut buffer = Vec::with_capacity(item.len() / 2);
+                    buffer.extend(
+                        item.chunks_exact(2)
+                            .map(|ch| u16::from_le_bytes([ch[0], ch[1]]))
+                            .take_while(|&ch| ch != 0),
+                    );
+                    Ok(UnicodeValue { buffer })
+                },
+            )?)),
+            PropertyType::MultipleBinary => Ok(Self::MultipleBinary(read_variable_values(
+                f,
+                control,
+                |item| {
+                    Ok(BinaryValue {
+                        buffer: item.to_vec(),
+                    })
+                },
+            )?)),
             _ => Err(LtpError::InvalidVariableLengthPropertyType(prop_type).into()),
         }
+    }
+}
+
+impl PropertyValueReadWrite for PropertyValue {
+    fn read(f: &mut dyn Read, prop_type: PropertyType) -> io::Result<Self> {
+        Self::read_with_control(f, prop_type, &ReadControl::default())
     }
 
     fn write(&self, f: &mut dyn Write) -> io::Result<()> {
@@ -969,7 +912,6 @@ where
 {
     node: <Pst as PstFile>::NodeBTreeEntry,
     tree: <Pst as PstFile>::PropertyTree,
-    block_cache: RefCell<DataBlockCache<Pst>>,
 }
 
 impl<Pst> PropertyContextInner<Pst>
@@ -1004,17 +946,19 @@ where
         IntermediateTreeEntryReadWrite,
 {
     fn new(node: <Pst as PstFile>::NodeBTreeEntry, tree: <Pst as PstFile>::PropertyTree) -> Self {
-        Self {
-            node,
-            tree,
-            block_cache: Default::default(),
-        }
+        Self { node, tree }
     }
 
     fn properties(&self) -> io::Result<BTreeMap<PropertyTreeRecordKey, PropertyTreeRecordValue>> {
-        Ok(self
-            .tree
-            .entries()?
+        let entries = self.tree.entries()?;
+        self.tree
+            .heap()
+            .read_control()
+            .check_allocation(entries.len().saturating_mul(
+                mem::size_of::<(PropertyTreeRecordKey, PropertyTreeRecordValue)>()
+                    + MAP_ENTRY_OVERHEAD,
+            ))?;
+        Ok(entries
             .into_iter()
             .map(|entry| {
                 (
@@ -1033,15 +977,39 @@ where
         page_cache: &mut RootBTreePageCache<<Pst as PstFile>::BlockBTree>,
         value: PropertyTreeRecordValue,
     ) -> io::Result<PropertyValue> {
+        let control = self.tree.heap().read_control();
+        control.charge(1)?;
         match value.value() {
-            PropertyValueRecord::Heap(heap_id) => {
-                if u32::from(heap_id) == 0 {
-                    return Ok(PropertyValue::Null);
-                }
+            PropertyValueRecord::Heap(heap_id) if u32::from(heap_id) == 0 => {
+                Ok(PropertyValue::Null)
+            }
+            PropertyValueRecord::Heap(_) | PropertyValueRecord::Node(_) => self
+                .with_property_reader(f, encoding, block_btree, page_cache, value, |reader| {
+                    PropertyValue::read_with_control(reader, value.prop_type(), control)
+                }),
+            small => small
+                .small_value(value.prop_type())
+                .ok_or(LtpError::InvalidSmallPropertyType(value.prop_type()).into()),
+        }
+    }
 
+    fn with_property_reader<R: PstReader, T>(
+        &self,
+        f: &mut R,
+        encoding: NdbCryptMethod,
+        block_btree: &PstFileReadWriteBlockBTree<Pst>,
+        page_cache: &mut RootBTreePageCache<<Pst as PstFile>::BlockBTree>,
+        value: PropertyTreeRecordValue,
+        read: impl FnOnce(&mut dyn Read) -> io::Result<T>,
+    ) -> io::Result<T> {
+        let control = self.tree.heap().read_control();
+        control.check()?;
+        match value.value() {
+            PropertyValueRecord::Heap(heap_id) if u32::from(heap_id) == 0 => read(&mut io::empty()),
+            PropertyValueRecord::Heap(heap_id) => {
                 let data = self.tree.heap().find_entry(heap_id)?;
-                let mut cursor = Cursor::new(data);
-                PropertyValueReadWrite::read(&mut cursor, value.prop_type())
+                control.check_payload(data.len())?;
+                read(&mut Cursor::new(data))
             }
             PropertyValueRecord::Node(sub_node_id) => {
                 let sub_node =
@@ -1050,28 +1018,35 @@ where
                         .ok_or(LtpError::PropertySubNodeValueNotFound(u32::from(
                             sub_node_id,
                         )))?;
-                let block = block_btree.find_entry(f, sub_node.search_key(), page_cache)?;
-                let sub_node_tree = SubNodeTree::<Pst>::read(f, &block)?;
-                let block = sub_node_tree.find_entry(f, block_btree, sub_node_id, page_cache)?;
-                let block = block_btree.find_entry(f, block.search_key(), page_cache)?;
-                let mut block_cache = self.block_cache.borrow_mut();
-                let data_tree = match block_cache.remove(&block.block().block()) {
-                    Some(data_tree) => data_tree,
-                    None => DataTree::read(f, encoding, &block)?,
-                };
-                let mut data = vec![];
-                let result = data_tree
-                    .reader(f, encoding, block_btree, page_cache, &mut block_cache)
-                    .and_then(|mut r| r.read_to_end(&mut data));
-                block_cache.insert(block.block().block(), data_tree);
-                let _ = result?;
-                let mut cursor = Cursor::new(data);
-                PropertyValueReadWrite::read(&mut cursor, value.prop_type())
+                let block =
+                    block_btree.find_entry(f, sub_node.search_key(), page_cache, control)?;
+                let tree = SubNodeTree::<Pst>::read(f, &block, control)?;
+                let block = tree.find_entry(f, block_btree, sub_node_id, page_cache, control)?;
+                let block = block_btree.find_entry(f, block.search_key(), page_cache, control)?;
+                let tree = DataTree::<Pst>::read(f, encoding, &block, control)?;
+                let mut reader = tree.reader(f, encoding, block_btree, page_cache, control)?;
+                read(&mut reader)
             }
-            small => small
-                .small_value(value.prop_type())
-                .ok_or(LtpError::InvalidSmallPropertyType(value.prop_type()).into()),
+            _ => Err(LtpError::InvalidSmallPropertyType(value.prop_type()).into()),
         }
+    }
+
+    fn copy_binary_property<R: PstReader>(
+        &self,
+        f: &mut R,
+        encoding: NdbCryptMethod,
+        block_btree: &PstFileReadWriteBlockBTree<Pst>,
+        page_cache: &mut RootBTreePageCache<<Pst as PstFile>::BlockBTree>,
+        value: PropertyTreeRecordValue,
+        writer: &mut dyn Write,
+    ) -> io::Result<u64> {
+        let control = self.tree.heap().read_control();
+        if value.prop_type() != PropertyType::Binary {
+            return Err(LtpError::InvalidVariableLengthPropertyType(value.prop_type()).into());
+        }
+        self.with_property_reader(f, encoding, block_btree, page_cache, value, |reader| {
+            control.copy_to(reader, writer)
+        })
     }
 }
 
@@ -1133,6 +1108,19 @@ impl PropertyContextReadWrite<UnicodePstFile> for UnicodePropertyContext {
         self.inner
             .read_property(f, encoding, block_btree, page_cache, value)
     }
+
+    fn copy_binary_property<R: PstReader>(
+        &self,
+        f: &mut R,
+        encoding: NdbCryptMethod,
+        block_btree: &UnicodeBlockBTree,
+        page_cache: &mut RootBTreePageCache<UnicodeBlockBTree>,
+        value: PropertyTreeRecordValue,
+        writer: &mut dyn Write,
+    ) -> io::Result<u64> {
+        self.inner
+            .copy_binary_property(f, encoding, block_btree, page_cache, value, writer)
+    }
 }
 
 pub struct AnsiPropertyContext {
@@ -1189,5 +1177,183 @@ impl PropertyContextReadWrite<AnsiPstFile> for AnsiPropertyContext {
     ) -> io::Result<PropertyValue> {
         self.inner
             .read_property(f, encoding, block_btree, page_cache, value)
+    }
+
+    fn copy_binary_property<R: PstReader>(
+        &self,
+        f: &mut R,
+        encoding: NdbCryptMethod,
+        block_btree: &AnsiBlockBTree,
+        page_cache: &mut RootBTreePageCache<AnsiBlockBTree>,
+        value: PropertyTreeRecordValue,
+        writer: &mut dyn Write,
+    ) -> io::Result<u64> {
+        self.inner
+            .copy_binary_property(f, encoding, block_btree, page_cache, value, writer)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncated_fixed_multi_values_are_not_silently_discarded() {
+        for (prop_type, width) in [
+            (PropertyType::MultipleInteger16, 2),
+            (PropertyType::MultipleInteger32, 4),
+            (PropertyType::MultipleFloating32, 4),
+            (PropertyType::MultipleFloating64, 8),
+            (PropertyType::MultipleCurrency, 8),
+            (PropertyType::MultipleFloatingTime, 8),
+            (PropertyType::MultipleInteger64, 8),
+            (PropertyType::MultipleTime, 8),
+        ] {
+            let data = vec![0; width + 1];
+            let error = PropertyValue::read(&mut &data[..], prop_type).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        }
+    }
+
+    #[test]
+    fn truncated_unicode_is_an_error() {
+        let error = PropertyValue::read(&mut &[0x41][..], PropertyType::Unicode).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn unicode_multi_value_requires_even_item_boundaries() {
+        let data = [1, 0, 0, 0, 8, 0, 0, 0, 0x41];
+        assert!(PropertyValue::read(&mut &data[..], PropertyType::MultipleUnicode).is_err());
+    }
+
+    #[test]
+    fn multi_value_offsets_must_fit_the_payload() {
+        for offsets in [[12_u32, 11], [12, 100], [13, 14]] {
+            let mut data = Vec::new();
+            data.write_u32::<LittleEndian>(2).unwrap();
+            for offset in offsets {
+                data.write_u32::<LittleEndian>(offset).unwrap();
+            }
+            data.extend_from_slice(&[0, 0]);
+            assert!(PropertyValue::read(&mut &data[..], PropertyType::MultipleBinary).is_err());
+        }
+    }
+
+    #[test]
+    fn empty_multi_value_items_are_preserved() {
+        let data = [2, 0, 0, 0, 12, 0, 0, 0, 12, 0, 0, 0, 7, 8];
+        let PropertyValue::MultipleBinary(values) =
+            PropertyValue::read(&mut &data[..], PropertyType::MultipleBinary).unwrap()
+        else {
+            panic!("unexpected property type");
+        };
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0].buffer(), &[]);
+        assert_eq!(values[1].buffer(), &[7, 8]);
+    }
+
+    #[test]
+    fn fixed_multi_value_propagates_reader_errors() {
+        struct BrokenReader;
+        impl Read for BrokenReader {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::ErrorKind::PermissionDenied.into())
+            }
+        }
+        let error = PropertyValue::read(&mut BrokenReader, PropertyType::MultipleTime).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn hostile_guid_count_is_rejected_before_item_reads() {
+        let control = ReadControl::new(crate::ReadLimits {
+            max_allocation: 64,
+            max_payload: 64,
+            ..Default::default()
+        });
+        let error = PropertyValue::read_with_control(
+            &mut &u32::MAX.to_le_bytes()[..],
+            PropertyType::MultipleGuid,
+            &control,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn decoded_multi_values_stay_within_the_allocation_limit() {
+        let count = 257;
+        let mut data = Vec::new();
+        data.write_u32::<LittleEndian>(count).unwrap();
+        for _ in 0..count {
+            data.write_u32::<LittleEndian>(4 * (count + 1)).unwrap();
+        }
+        let control = ReadControl::new(crate::ReadLimits {
+            max_allocation: 8192,
+            ..Default::default()
+        });
+        let PropertyValue::MultipleBinary(values) = PropertyValue::read_with_control(
+            &mut &data[..],
+            PropertyType::MultipleBinary,
+            &control,
+        )
+        .unwrap() else {
+            panic!("unexpected property type");
+        };
+        assert_eq!(values.len(), count as usize);
+        assert!(values.capacity() * mem::size_of::<BinaryValue>() + data.len() <= 8192);
+    }
+
+    #[test]
+    fn decoded_unicode_multi_values_stay_within_the_allocation_limit() {
+        let mut data = Vec::new();
+        data.write_u32::<LittleEndian>(1).unwrap();
+        data.write_u32::<LittleEndian>(8).unwrap();
+        for _ in 0..257 {
+            data.write_u16::<LittleEndian>(0x41).unwrap();
+        }
+        data.write_u16::<LittleEndian>(0).unwrap();
+        let control = ReadControl::new(crate::ReadLimits {
+            max_allocation: 1024,
+            ..Default::default()
+        });
+        let PropertyValue::MultipleUnicode(values) = PropertyValue::read_with_control(
+            &mut &data[..],
+            PropertyType::MultipleUnicode,
+            &control,
+        )
+        .unwrap() else {
+            panic!("unexpected property type");
+        };
+        assert_eq!(values[0].buffer().len(), 257);
+        let retained = values.capacity() * mem::size_of::<UnicodeValue>()
+            + values
+                .iter()
+                .map(|value| value.buffer.capacity() * mem::size_of::<u16>())
+                .sum::<usize>();
+        assert!(retained <= 1024, "retained {retained} bytes");
+    }
+
+    #[test]
+    fn property_payload_limit_and_cancellation_are_enforced() {
+        let control = ReadControl::new(crate::ReadLimits {
+            max_payload: 4,
+            ..Default::default()
+        });
+        assert!(PropertyValue::read_with_control(
+            &mut &[1, 2, 3, 4, 5][..],
+            PropertyType::Binary,
+            &control,
+        )
+        .is_err());
+        control.cancel();
+        let error = PropertyValue::read_with_control(
+            &mut &[][..],
+            PropertyType::MultipleInteger16,
+            &control,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
     }
 }

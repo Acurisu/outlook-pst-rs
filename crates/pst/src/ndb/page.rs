@@ -3,6 +3,7 @@
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use core::mem;
 use std::{
+    collections::BTreeMap,
     fmt::Debug,
     io::{self, Cursor, Read, Seek, SeekFrom, Write},
     marker::PhantomData,
@@ -11,7 +12,8 @@ use std::{
 
 use super::{block_id::*, block_ref::*, byte_index::*, node_id::*, read_write::*, *};
 use crate::{
-    block_sig::compute_sig, crc::compute_crc, AnsiPstFile, PstFile, PstReader, UnicodePstFile,
+    block_sig::compute_sig, crc::compute_crc, read_control::limit_error, AnsiPstFile, PstFile,
+    PstReader, ReadControl, UnicodePstFile,
 };
 
 /// `ptype`
@@ -69,6 +71,11 @@ impl PageType {
 }
 
 pub const PAGE_SIZE: usize = 512;
+
+/// Upper bound on the B-tree pages retained by a lookup cache.
+const MAX_CACHED_PAGES: usize = 64;
+/// Estimated in-memory size of one decoded B-tree page.
+const CACHED_PAGE_ALLOCATION: usize = PAGE_SIZE * 4;
 
 /// [PAGETRAILER](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/f4ccb38a-930a-4db4-98df-a69c195926ba)
 pub trait PageTrailer {
@@ -2268,32 +2275,69 @@ where
         f: &mut R,
         key: <Pst as PstFile>::BTreeKey,
         page_cache: &mut RootBTreePageCache<Self>,
+        control: &ReadControl,
     ) -> io::Result<Entry> {
+        control.check()?;
+        let cache_limit =
+            MAX_CACHED_PAGES.min(control.limits().max_allocation / CACHED_PAGE_ALLOCATION);
+        while page_cache.len() > cache_limit {
+            page_cache.pop_first();
+        }
         let search_key: u64 = key.into();
-        match self {
-            Self::Intermediate(page, ..) => {
-                let entries = <Self::IntermediatePage as BTreePage>::entries(page);
-                let index = entries.partition_point(|entry| entry.key().into() <= search_key);
-                let entry = index
-                    .checked_sub(1)
-                    .and_then(|index| entries.get(index))
-                    .ok_or(NdbError::BTreePageNotFound(search_key))?;
-                let block = entry.block();
-                let page = match page_cache.remove(&block.block()) {
-                    Some(page) => page,
-                    None => <Self as RootBTreeReadWrite>::read(f, block)?,
-                };
-                let entry = page.find_entry(f, key, page_cache);
-                page_cache.insert(block.block(), page);
-                entry
+        // The page being searched below the root, keyed for the cache once it is left.
+        let mut current = None;
+        let mut depth = 0;
+        loop {
+            control.charge(1)?;
+            control.check_depth(depth)?;
+            let (block, parent_level) = match current.as_ref().map_or(self, |(_, page)| page) {
+                Self::Intermediate(page, ..) => {
+                    let entries = <Self::IntermediatePage as BTreePage>::entries(page);
+                    if entries.is_empty() {
+                        return Err(NdbError::InvalidBTreeEntryCount(0).into());
+                    }
+                    check_key_order(entries)?;
+                    let index = entries.partition_point(|entry| entry.key().into() <= search_key);
+                    let block = index
+                        .checked_sub(1)
+                        .and_then(|index| entries.get(index))
+                        .ok_or(NdbError::BTreePageNotFound(search_key))?
+                        .block();
+                    (block, page.level())
+                }
+                Self::Leaf(page) => {
+                    let entries = <Self::LeafPage as BTreePage>::entries(page);
+                    check_key_order(entries)?;
+                    let entry = entries
+                        .iter()
+                        .find(|entry| entry.key().into() == search_key)
+                        .copied()
+                        .ok_or_else(|| NdbError::BTreePageNotFound(search_key).into());
+                    cache_page(page_cache, cache_limit, current);
+                    return entry;
+                }
+            };
+            let next = match page_cache.remove(&block.block()) {
+                Some(page) => page,
+                None => {
+                    control.check_allocation(CACHED_PAGE_ALLOCATION)?;
+                    <Self as RootBTreeReadWrite>::read(f, block)?
+                }
+            };
+            // Child levels must strictly decrease, which also rules out cycles.
+            let level = match &next {
+                Self::Intermediate(page, ..) => page.level(),
+                Self::Leaf(page) => page.level(),
+            };
+            if level.checked_add(1) != Some(parent_level) {
+                return Err(NdbError::InvalidBTreePageLevel(level).into());
             }
-            Self::Leaf(page) => {
-                let entry = <Self::LeafPage as BTreePage>::entries(page)
-                    .iter()
-                    .find(|entry| entry.key().into() == search_key)
-                    .ok_or(NdbError::BTreePageNotFound(search_key))?;
-                Ok(*entry)
-            }
+            cache_page(
+                page_cache,
+                cache_limit,
+                current.replace((block.block(), next)),
+            );
+            depth += 1;
         }
     }
 }
@@ -2331,8 +2375,9 @@ where
         f: &mut R,
         key: <Pst as PstFile>::BTreeKey,
         page_cache: &mut RootBTreePageCache<Self>,
+        control: &ReadControl,
     ) -> io::Result<Entry> {
-        <Self as RootBTreeReadWrite>::find_entry(self, f, key, page_cache)
+        <Self as RootBTreeReadWrite>::find_entry(self, f, key, page_cache, control)
     }
 }
 
@@ -2379,3 +2424,30 @@ impl NodeBTreeReadWrite<UnicodePstFile, UnicodeNodeBTreeEntry> for UnicodeNodeBT
 pub type AnsiNodeBTree = AnsiBTree<AnsiNodeBTreeEntry, AnsiNodeBTreePage>;
 impl NodeBTree<AnsiPstFile, AnsiNodeBTreeEntry> for AnsiNodeBTree {}
 impl NodeBTreeReadWrite<AnsiPstFile, AnsiNodeBTreeEntry> for AnsiNodeBTree {}
+
+fn check_key_order<Entry: BTreeEntry>(entries: &[Entry]) -> io::Result<()>
+where
+    Entry::Key: Into<u64>,
+{
+    if entries
+        .windows(2)
+        .any(|pair| pair[0].key().into() >= pair[1].key().into())
+    {
+        return Err(limit_error("Invalid PST B-tree key ordering"));
+    }
+    Ok(())
+}
+
+fn cache_page<Key: Ord, Page>(
+    page_cache: &mut BTreeMap<Key, Page>,
+    cache_limit: usize,
+    page: Option<(Key, Page)>,
+) {
+    let Some((key, page)) = page.filter(|_| cache_limit > 0) else {
+        return;
+    };
+    while page_cache.len() >= cache_limit {
+        page_cache.pop_first();
+    }
+    page_cache.insert(key, page);
+}

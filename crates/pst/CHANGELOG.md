@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Shared configurable read limits and cooperative cancellation.
+- Incremental table rows and data-tree cursors, and streamed attachment payload copying.
+- Object-safe attachment opening for messages and recursively embedded messages.
+
+### Changed
+
+- Folder table accessors and table row iteration now expose read failures.
+- Replaced `AttachmentData` and concrete attachment constructors with trait-based
+  attachment access, `embedded_message`, and `copy_data`.
+- Low-level traversal APIs take explicit read controls while ordinary constructors
+  apply finite defaults.
+
+### Fixed
+
+- Nested embedded-message file-lock deadlock and attachment-local subnode lookup.
+- Missing `PtypObject` decoding for embedded and storage attachments.
+- Corrupt folder tables incorrectly treated as absent.
+- Truncated property values and I/O errors silently accepted as partial values.
+- Unchecked multivalue counts, heap slices, and internal-block size arithmetic.
+- Unbounded decoded row retention, traversal, and page-cache growth.
+- Cyclic or mis-leveled B-tree, data-tree, and subnode-tree pages accepted during traversal.
+- Empty variable-size table columns (heap ID 0) failing to decode instead of reading as null.
+
 ## [1.2.0](https://github.com/microsoft/outlook-pst-rs/compare/outlook-pst-v1.1.0...outlook-pst-v1.2.0) - 2026-03-17
 
 ### Added

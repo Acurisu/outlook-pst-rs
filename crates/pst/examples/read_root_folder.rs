@@ -9,6 +9,7 @@ fn main() -> anyhow::Result<()> {
     let context = hierarchy_table.context();
 
     for row in hierarchy_table.rows_matrix() {
+        let row = row?;
         println!("Row: 0x{:X}", u32::from(row.id()));
         println!("Version: 0x{:X}", row.unique());
 

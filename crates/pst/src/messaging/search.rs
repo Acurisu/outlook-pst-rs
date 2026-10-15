@@ -4,6 +4,7 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::{
     io::{self, Cursor, Read, Write},
     marker::PhantomData,
+    mem,
     rc::Rc,
 };
 
@@ -493,6 +494,7 @@ where
         let encoding = header.crypt_method();
         let root = header.root();
 
+        let control = pst.read_control();
         let mut file = pst
             .reader()
             .lock()
@@ -507,6 +509,7 @@ where
             file,
             u32::from(NID_SEARCH_MANAGEMENT_QUEUE).into(),
             &mut page_cache,
+            control,
         )?;
 
         let start = node.parent().map(u32::from).unwrap_or_default();
@@ -525,19 +528,11 @@ where
         }
 
         let mut page_cache = Default::default();
-        let block = block_btree.find_entry(file, key, &mut page_cache)?;
-        let tree = DataTree::<Pst>::read(file, encoding, &block)?;
-        let mut data = Vec::new();
-        let mut block_cache = Default::default();
-        let size = tree
-            .reader(
-                file,
-                encoding,
-                &block_btree,
-                &mut page_cache,
-                &mut block_cache,
-            )?
-            .read_to_end(&mut data)?;
+        let block = block_btree.find_entry(file, key, &mut page_cache, control)?;
+        let tree = DataTree::<Pst>::read(file, encoding, &block, control)?;
+        let mut reader = tree.reader(file, encoding, &block_btree, &mut page_cache, control)?;
+        let data = control.read_to_vec(&mut reader)?;
+        let size = data.len();
 
         if size % SEARCH_UPDATE_SIZE as usize != 0 {
             return Err(MessagingError::InvalidSearchUpdateQueueSize(size).into());
@@ -545,6 +540,12 @@ where
 
         let updates = if size > start {
             let count = (size - start) / SEARCH_UPDATE_SIZE as usize;
+            control.charge(count)?;
+            control.check_allocation(
+                count
+                    .saturating_mul(mem::size_of::<SearchUpdate>())
+                    .saturating_add(data.len()),
+            )?;
             let mut updates = Vec::with_capacity(count);
             let mut cursor = Cursor::new(&data[start..]);
             while let Ok(entry) = SearchUpdate::read(&mut cursor) {

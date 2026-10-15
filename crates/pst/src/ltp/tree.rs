@@ -1,7 +1,6 @@
 //! ## [BTree-on-Heap (BTH)](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/2dd1a95a-c8b1-4ac5-87d1-10cb8de64053)
 
 use byteorder::{ReadBytesExt, WriteBytesExt};
-use core::mem;
 use std::{
     io::{self, Cursor, Read, Write},
     marker::PhantomData,
@@ -227,6 +226,8 @@ where
     }
 
     fn entries(&self) -> io::Result<Vec<HeapTreeLeafEntry<K, V>>> {
+        let control = self.heap.read_control();
+        control.charge(1)?;
         let header = self.header()?;
         if header.key_size() != K::SIZE {
             return Err(LtpError::InvalidHeapTreeKeySize(header.key_size()).into());
@@ -234,33 +235,44 @@ where
         if header.entry_size() != V::SIZE {
             return Err(LtpError::InvalidHeapTreeDataSize(header.entry_size()).into());
         }
-
+        control.check_depth(usize::from(header.levels()))?;
         if u32::from(header.root()) == 0 {
-            return Ok(Default::default());
+            return Ok(Vec::new());
         }
-
-        let mut level = header.levels();
-        let mut next_level = vec![header.root()];
-
-        while level > 0 {
-            for heap_id in mem::take(&mut next_level).into_iter() {
-                let mut cursor = Cursor::new(self.heap.find_entry(heap_id)?);
-                while let Ok(row) = HeapTreeIntermediateEntry::<K>::read(&mut cursor) {
-                    next_level.push(row.next_level());
-                }
-            }
-
-            level -= 1;
-        }
-
+        let mut pending = vec![(header.root(), header.levels())];
         let mut results = Vec::new();
-        for heap_id in mem::take(&mut next_level).into_iter() {
-            let mut cursor = Cursor::new(self.heap.find_entry(heap_id)?);
-            while let Ok(row) = HeapTreeLeafEntry::<K, V>::read(&mut cursor) {
-                results.push(row);
+        while let Some((heap_id, level)) = pending.pop() {
+            control.charge(1)?;
+            let data = self.heap.find_entry(heap_id)?;
+            let mut cursor = Cursor::new(data);
+            if level == 0 {
+                let size = usize::from(K::SIZE) + usize::from(V::SIZE);
+                if data.len() % size != 0 {
+                    return Err(io::ErrorKind::UnexpectedEof.into());
+                }
+                let count = data.len() / size;
+                control.charge(count)?;
+                control.reserve(&mut results, count)?;
+                for _ in 0..count {
+                    results.push(HeapTreeLeafEntry::<K, V>::read(&mut cursor)?);
+                }
+            } else {
+                let size = usize::from(K::SIZE) + 4;
+                if data.len() % size != 0 {
+                    return Err(io::ErrorKind::UnexpectedEof.into());
+                }
+                let count = data.len() / size;
+                control.charge(count)?;
+                control.reserve(&mut pending, count)?;
+                let start = pending.len();
+                for _ in 0..count {
+                    let entry = HeapTreeIntermediateEntry::<K>::read(&mut cursor)?;
+                    pending.push((entry.next_level(), level - 1));
+                }
+                // Pop children in key order.
+                pending[start..].reverse();
             }
         }
-
         Ok(results)
     }
 }
